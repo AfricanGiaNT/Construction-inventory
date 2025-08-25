@@ -14,7 +14,7 @@ except ImportError:
             "Please install pydantic-settings: pip install pydantic-settings"
         )
 
-from pydantic import validator
+from pydantic import field_validator, ConfigDict
 
 
 class Settings(BaseSettings):
@@ -48,7 +48,8 @@ class Settings(BaseSettings):
     # Background Worker Settings
     worker_sleep_interval: int = 10  # seconds between polling cycles
     
-    @validator("telegram_allowed_chat_ids")
+    @field_validator("telegram_allowed_chat_ids")
+    @classmethod
     def parse_chat_ids(cls, v: Optional[str]) -> List[int]:
         """Parse comma-separated chat IDs into a list of integers."""
         if not v:
@@ -58,9 +59,10 @@ class Settings(BaseSettings):
         except ValueError:
             raise ValueError("Invalid chat ID format. Use comma-separated integers.")
     
-    class Config:
-        env_file = "config/.env"
-        env_file_encoding = "utf-8"
+    model_config = ConfigDict(
+        env_file="config/.env",
+        env_file_encoding="utf-8"
+    )
 
 
 # Global settings instance - will be created when needed

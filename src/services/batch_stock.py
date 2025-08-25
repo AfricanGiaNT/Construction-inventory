@@ -88,7 +88,7 @@ class BatchStockService:
                 user_name=user_name,
                 chat_id=chat_id,
                 before_levels=before_levels,
-                timestamp=datetime.utcnow()
+                timestamp=datetime.now(UTC)
             )
             
             # Store in pending approvals

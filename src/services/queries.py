@@ -21,7 +21,7 @@ class QueryService:
         """Generate a daily inventory report."""
         try:
             if not date:
-                date = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+                date = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
             
             # Get daily movements
             movements = await self.airtable.get_daily_movements(date)
@@ -65,7 +65,7 @@ class QueryService:
                 "low_stock_count": len(low_stock),
                 "low_stock_items": low_stock,
                 "pending_approvals": len(pending_approvals),
-                "last_updated": datetime.utcnow().isoformat()
+                "last_updated": datetime.now(UTC).isoformat()
             }
             
         except Exception as e:
@@ -74,7 +74,7 @@ class QueryService:
                 "low_stock_count": 0,
                 "low_stock_items": [],
                 "pending_approvals": 0,
-                "last_updated": datetime.utcnow().isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
                 "error": str(e)
             }
     

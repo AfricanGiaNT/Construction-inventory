@@ -869,7 +869,7 @@ class ConstructionInventoryBot:
                 if args and args[0] == "onhand":
                     success, message, csv_data = await self.query_service.export_inventory_csv()
                     if success and csv_data:
-                        filename = f"inventory_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+                        filename = f"inventory_export_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}.csv"
                         await self.telegram_service.send_csv_export(chat_id, csv_data, filename)
                     else:
                         await self.telegram_service.send_error_message(chat_id, message)

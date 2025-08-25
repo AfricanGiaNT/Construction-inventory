@@ -240,7 +240,7 @@ class ApprovalService:
                 "pending_items": [item["sku"] for item in pending],
                 "pending_batches": batch_pending_count,
                 "pending_batch_movements": batch_pending_movements,
-                "last_updated": datetime.utcnow().isoformat()
+                "last_updated": datetime.now(UTC).isoformat()
             }
             
         except Exception as e:
@@ -250,7 +250,7 @@ class ApprovalService:
                 "pending_items": [],
                 "pending_batches": 0,
                 "pending_batch_movements": 0,
-                "last_updated": datetime.utcnow().isoformat(),
+                "last_updated": datetime.now(UTC).isoformat(),
                 "error": str(e)
             }
     
