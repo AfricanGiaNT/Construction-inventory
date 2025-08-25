@@ -3,7 +3,7 @@
 import logging
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import List, Optional, Tuple, Dict, Any
 
 from ..schemas import (
@@ -361,8 +361,8 @@ class BatchStockService:
     def _get_error_suggestion(self, error_message: str) -> str:
         """Generate helpful suggestions based on error messages using ErrorHandler."""
         # Use the ErrorHandler to categorize and get suggestions
-        error_info = ErrorHandler.categorize_error(error_message)
-        return error_info["suggestion"]
+        error_type, suggestion = ErrorHandler.categorize_error(error_message)
+        return suggestion
     
     def _generate_summary_message(self, total: int, successful: int, failed: int, 
                                 success_rate: float, rollback_performed: bool) -> str:

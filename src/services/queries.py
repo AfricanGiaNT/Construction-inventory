@@ -1,7 +1,7 @@
 """Query and reporting service for the Construction Inventory Bot."""
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from typing import List, Optional, Tuple
 
 from ..schemas import DailyReport

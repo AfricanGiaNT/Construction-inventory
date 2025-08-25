@@ -86,6 +86,35 @@ class AirtableClient:
             logger.error(f"Error searching items: {e}")
             return []
     
+    async def get_all_items(self) -> List[Item]:
+        """Get all items from the database for fuzzy search."""
+        try:
+            all_records = self.items_table.all()
+            items = []
+            
+            for record in all_records:
+                fields = record["fields"]
+                item = Item(
+                    name=fields.get("Name", ""),
+                    sku=fields.get("Name", ""),  # Use name as SKU
+                    description=None,  # Aliases field removed
+                    base_unit=fields.get("Base Unit", ""),
+                    units=[],
+                    on_hand=fields.get("On Hand", 0.0),
+                    threshold=fields.get("Reorder Level"),
+                    location=fields.get("Preferred Location", [None])[0] if fields.get("Preferred Location") else None,
+                    category=fields.get("Category", ""),
+                    large_qty_threshold=fields.get("Large Qty Threshold")
+                )
+                items.append(item)
+            
+            logger.info(f"Retrieved {len(items)} items from database")
+            return items
+            
+        except Exception as e:
+            logger.error(f"Error getting all items: {e}")
+            return []
+    
     async def test_connection(self) -> bool:
         """Test the connection to Airtable."""
         try:
@@ -548,3 +577,103 @@ class AirtableClient:
         except Exception as e:
             logger.error(f"Error creating user {telegram_user_id}: {e}")
             return False
+
+    async def get_item_movements(self, item_name: str, limit: int = 50) -> List[StockMovement]:
+        """
+        Get movement history for a specific item.
+        
+        Args:
+            item_name: Name of the item
+            limit: Maximum number of movements to return
+            
+        Returns:
+            List of stock movements for the item
+        """
+        try:
+            # Get the item first to ensure it exists
+            item = await self.get_item(item_name)
+            if not item:
+                logger.warning(f"Item '{item_name}' not found for movement history")
+                return []
+            
+            # Get movements from the Stock Movements table
+            formula = match({"Item Name": item_name})
+            records = self.movements_table.all(formula=formula, max_records=limit)
+            
+            movements = []
+            for record in records:
+                fields = record["fields"]
+                
+                # Parse movement type
+                movement_type_str = fields.get("Movement Type", "IN")
+                try:
+                    movement_type = MovementType(movement_type_str)
+                except ValueError:
+                    movement_type = MovementType.IN
+                
+                # Create StockMovement object
+                movement = StockMovement(
+                    item_name=fields.get("Item Name", item_name),
+                    movement_type=movement_type,
+                    quantity=fields.get("Quantity", 0.0),
+                    unit=fields.get("Unit", item.base_unit),
+                    signed_base_quantity=fields.get("Signed Base Quantity", 0.0),
+                    user_id=fields.get("User ID", ""),
+                    user_name=fields.get("User Name", "Unknown"),
+                    location=fields.get("Location", item.location),
+                    project=fields.get("Project", ""),
+                    note=fields.get("Note", ""),
+                    timestamp=datetime.fromisoformat(fields.get("Timestamp", datetime.now().isoformat())),
+                    status=fields.get("Status", "Completed")
+                )
+                movements.append(movement)
+            
+            # Sort by timestamp (most recent first)
+            movements.sort(key=lambda x: x.timestamp, reverse=True)
+            
+            logger.info(f"Retrieved {len(movements)} movements for item '{item_name}'")
+            return movements
+            
+        except Exception as e:
+            logger.error(f"Error getting movements for item '{item_name}': {e}")
+            return []
+    
+    async def get_pending_approvals_for_item(self, item_name: str) -> List[dict]:
+        """
+        Get pending batch approvals that contain the specified item.
+        
+        Args:
+            item_name: Name of the item to check
+            
+        Returns:
+            List of pending batch approvals containing the item
+        """
+        try:
+            # This method will need to be implemented based on how batch approvals are stored
+            # For now, we'll return an empty list as this is a TODO in the plan
+            logger.info(f"Getting pending approvals for item '{item_name}' (not yet implemented)")
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error getting pending approvals for item '{item_name}': {e}")
+            return []
+    
+    async def get_item_last_updated(self, item_name: str) -> Optional[datetime]:
+        """
+        Get the last time an item was updated (based on most recent movement).
+        
+        Args:
+            item_name: Name of the item
+            
+        Returns:
+            Last update timestamp or None if no movements found
+        """
+        try:
+            movements = await self.get_item_movements(item_name, limit=1)
+            if movements:
+                return movements[0].timestamp
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting last updated time for item '{item_name}': {e}")
+            return None

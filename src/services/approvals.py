@@ -1,7 +1,7 @@
 """Approval workflow service for the Construction Inventory Bot."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import List, Optional, Tuple, Dict, Any
 
 from ..schemas import MovementStatus, UserRole, BatchResult

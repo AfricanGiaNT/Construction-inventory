@@ -27,7 +27,8 @@ class CommandParser:
             "export": r"^/export\s+(onhand)$",
             "batchhelp": r"^/batchhelp$",
             "status": r"^/status$",
-            "validate": r"^/validate\s+([\s\S]+)$"  # Captures everything after /validate including newlines
+            "validate": r"^/validate\s+([\s\S]+)$",  # Captures everything after /validate including newlines
+            "stock": r"^/stock\s+(.+)$"  # Captures everything after /stock for fuzzy search
         }
         
         # Initialize NLP parser

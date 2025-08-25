@@ -32,6 +32,10 @@ class AuthService:
         if not self.settings.telegram_allowed_chat_ids:
             return True
         
+        # If the list is empty, allow all chats
+        if len(self.settings.telegram_allowed_chat_ids) == 0:
+            return True
+        
         # Otherwise, check if the chat ID is in the allowed list
         return chat_id in self.settings.telegram_allowed_chat_ids
     
@@ -43,6 +47,7 @@ class AuthService:
             "whoami": [UserRole.ADMIN, UserRole.STAFF, UserRole.VIEWER],
             "find": [UserRole.ADMIN, UserRole.STAFF, UserRole.VIEWER],
             "onhand": [UserRole.ADMIN, UserRole.STAFF, UserRole.VIEWER],
+            "stock": [UserRole.ADMIN, UserRole.STAFF, UserRole.VIEWER],  # All users can query stock
             "in": [UserRole.ADMIN, UserRole.STAFF],  # Staff can add stock
             "out": [UserRole.ADMIN, UserRole.STAFF],  # Staff can remove stock
             "adjust": [UserRole.ADMIN],  # Only admins can adjust

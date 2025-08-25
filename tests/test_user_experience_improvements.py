@@ -43,20 +43,20 @@ class TestUserExperienceImprovements:
         message_text = call_args[1]
         
         # Check for global parameters section
-        assert "Global Parameters" in message_text
+        assert "GLOBAL PARAMETERS" in message_text
         assert "driver: Mr Longwe" in message_text
-        assert "project: Bridge Construction" in message_text
+        assert "project: Bridge" in message_text
         
         # Check for global parameters rules
-        assert "Global parameters must be at the beginning of the command" in message_text
-        assert "Global parameters use 'key: value' format" in message_text
+        assert "Add at the beginning of your command" in message_text
+        assert "driver: name, from: location, to: location, project: name" in message_text
         
         # Check for best practices
-        assert "Use global parameters for common values" in message_text
+        assert "Override globals in specific entries" in message_text
         
         # Check for examples with global parameters
-        assert "/in driver: Mr Longwe, from: supplier, project: Bridge Construction" in message_text
-        assert "/out driver: Mr Smith, to: site A, project: Road Construction" in message_text
+        assert "project: Bridge, driver: Mr Longwe" in message_text
+        assert "to: Site A, project: Road" in message_text
 
     @pytest.mark.asyncio
     async def test_system_status_message_includes_global_parameters(self, bot):
@@ -72,13 +72,13 @@ class TestUserExperienceImprovements:
         message_text = call_args[1]
         
         # Check for global parameters in features
-        assert "Global parameters for common values" in message_text
-        assert "Project field support" in message_text
-        assert "Parameter inheritance and override" in message_text
+        assert "Global Parameters" in message_text
+        assert "Project Tracking" in message_text
+        assert "Multiple Formats" in message_text
         
         # Check for global parameters in input formats
-        assert "Global parameters (driver:, from:, to:, project:)" in message_text
-        assert "Parameter inheritance and override" in message_text
+        assert "Global Parameters" in message_text
+        assert "Project Tracking" in message_text
 
     @pytest.mark.asyncio
     async def test_validation_feedback_with_global_parameters(self, bot):

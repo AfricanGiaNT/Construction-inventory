@@ -6,7 +6,7 @@ from typing import List, Optional, Dict, Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.error import TelegramError
 
-from .schemas import StockMovement, MovementType
+from .schemas import StockMovement, MovementType, Item
 
 # Settings will be passed in constructor
 
@@ -105,14 +105,18 @@ class TelegramService:
                 f"<b>Items:</b>\n"
             )
             
-            # Add item summary - show all items for complete verification
-            for i, movement in enumerate(movements, 1):
+            # Add item summary, limited to 10 items for readability
+            for i, movement in enumerate(movements[:10], 1):
                 direction = "➕" if movement.movement_type == MovementType.IN else "➖"
                 if movement.movement_type == MovementType.ADJUST:
                     # For adjustments, show + or - based on the signed quantity
                     direction = "➕" if movement.signed_base_quantity >= 0 else "➖"
                     
                 text += f"{i}. {direction} <b>{movement.item_name}</b>: {abs(movement.quantity)} {movement.unit}\n"
+            
+            # If there are more than 10 items, show a count of remaining
+            if len(movements) > 10:
+                text += f"\n... and {len(movements) - 10} more items\n"
             
             text += f"\nPlease approve or reject this batch request."
             
@@ -133,6 +137,124 @@ class TelegramService:
             logger.error(f"Error sending batch approval request: {e}")
             return False
     
+    async def send_stock_search_results(self, chat_id: int, query: str, 
+                                      results: List[Item], pending_info: dict, 
+                                      total_count: int = None) -> bool:
+        """
+        Send stock search results with inline keyboard for easy selection.
+        
+        Args:
+            chat_id: Telegram chat ID to send the message to
+            query: Original search query
+            results: List of search results (should be max 3)
+            pending_info: Dictionary with pending movements info
+            total_count: Total count of matching items (for "Showing top 3 of X" message)
+            
+        Returns:
+            Boolean indicating success or failure
+        """
+        try:
+            # Create search results text
+            text = (
+                f"🔍 <b>Stock Query Results for \"{query}\"</b>\n\n"
+            )
+            
+            # Add result count message if total_count is provided
+            if total_count and total_count > 3:
+                text += f"<i>Showing top 3 of {total_count} results</i>\n\n"
+            
+            # Add numbered results - only show item names initially
+            for i, item in enumerate(results, 1):
+                text += f"{i}. <b>{item.name}</b>\n"
+            
+            text += "\n"
+            
+            # Add instructions
+            text += "<b>How to select an item:</b>\n"
+            text += "• Click the button below the item name\n"
+            text += "• Or type the <b>exact name</b> (e.g., 'cement bags')\n"
+            text += "• Or type the <b>number</b> (e.g., '1' for the first item)"
+            
+            # Create inline keyboard with 3 buttons
+            keyboard = []
+            for i, item in enumerate(results, 1):
+                # Create a safe callback data (limit to 64 characters)
+                item_name_slug = item.name.replace(" ", "_").replace("-", "_")[:30]
+                callback_data = f"stock_item_{i}_{item_name_slug}"
+                
+                keyboard.append([{
+                    "text": f"{i}. {item.name}",
+                    "callback_data": callback_data
+                }])
+            
+            # Send the message with inline keyboard
+            message_sent = await self.send_message(
+                chat_id, 
+                text, 
+                reply_markup={"inline_keyboard": keyboard}
+            )
+            return message_sent
+            
+        except Exception as e:
+            logger.error(f"Error sending stock search results: {e}")
+            return False
+
+    async def send_item_details(self, chat_id: int, item: Item, 
+                              pending_movements: List[StockMovement], 
+                              in_pending_batch: bool) -> bool:
+        """
+        Send detailed information for a specific item.
+        
+        Args:
+            chat_id: Telegram chat ID to send the message to
+            item: The item to display details for
+            pending_movements: List of pending movements for the item
+            in_pending_batch: Whether the item is in a pending batch
+            
+        Returns:
+            Boolean indicating success or failure
+        """
+        try:
+            # Create detailed item information text
+            text = f"📦 <b>Item Details: {item.name}</b>\n\n"
+            
+            # Basic stock information
+            text += f"<b>Stock Level:</b> {item.on_hand} {item.base_unit}\n"
+            text += f"<b>Reorder Threshold:</b> {item.threshold} {item.base_unit}\n"
+            
+            if item.location:
+                text += f"<b>Preferred Location:</b> {item.location}\n"
+            
+            if item.category:
+                text += f"<b>Category:</b> {item.category}\n"
+            
+            if item.large_qty_threshold:
+                text += f"<b>Large Qty Threshold:</b> {item.large_qty_threshold} {item.base_unit}\n"
+            
+            # Pending information
+            if pending_movements:
+                text += f"\n<b>Pending Movements:</b> {len(pending_movements)}\n"
+                for i, movement in enumerate(pending_movements[:3], 1):  # Show first 3
+                    direction = "➕" if movement.movement_type.value == "IN" else "➖"
+                    text += f"{i}. {direction} {movement.quantity} {movement.unit}"
+                    if movement.project:
+                        text += f" (Project: {movement.project})"
+                    text += "\n"
+                
+                if len(pending_movements) > 3:
+                    text += f"... and {len(pending_movements) - 3} more pending movements\n"
+            
+            if in_pending_batch:
+                text += f"\n🔄 <b>This item is part of a pending batch approval</b>\n"
+            
+            # Send the message
+            message_sent = await self.send_message(chat_id, text)
+            return message_sent
+            
+        except Exception as e:
+            logger.error(f"Error sending item details: {e}")
+            return False
+
     async def send_batch_success_summary(self, chat_id: int, batch_id: str,
                                        movements: List[StockMovement],
                                        before_levels: Dict[str, float],
@@ -272,66 +394,126 @@ class TelegramService:
             logger.error(f"Error sending CSV export: {e}")
             return False
     
-    async def send_help_message(self, chat_id: int, user_role: str) -> bool:
-        """Send help message with available commands."""
+    async def send_help_message(self, chat_id: int, user_role: str, search_term: str = None) -> bool:
+        """Send help message with available commands, optionally filtered by search term."""
         try:
             text = f"🤖 <b>CONSTRUCTION INVENTORY BOT</b>\n\n"
             
             # User role and quick intro
             text += f"<b>Role:</b> {user_role.title()}\n\n"
             
-            # Core commands - everyone can use these
-            text += "📋 <b>CORE COMMANDS</b>\n"
-            text += "• <b>/help</b> - This help message\n"
+            # If search term provided, show filtered results
+            if search_term:
+                text += f"🔍 <b>Search Results for \"{search_term}\"</b>\n\n"
+                return await self._send_filtered_help(chat_id, text, user_role, search_term.lower())
+            
+            # Show full help message
+            text += "📋 <b>AVAILABLE COMMANDS</b>\n\n"
+            
+            # Stock Operations
+            text += "📦 <b>Stock Operations</b>\n"
+            text += "• <b>/in</b> <i>item, qty unit, [details]</i> - Add stock\n"
+            text += "• <b>/out</b> <i>item, qty unit, [details]</i> - Remove stock\n"
+            text += "• <b>/adjust</b> <i>item, ±qty unit</i> - Correct stock (admin)\n\n"
+            
+            # Queries
+            text += "🔍 <b>Queries</b>\n"
+            text += "• <b>/stock</b> <i>item</i> - Fuzzy search with detailed info\n"
             text += "• <b>/find</b> <i>item</i> - Search inventory\n"
             text += "• <b>/onhand</b> <i>item</i> - Check stock level\n"
             text += "• <b>/whoami</b> - Show your role\n\n"
             
-            # Batch commands - staff and admin only
+            # Management
             if user_role in ["admin", "staff"]:
-                text += "📦 <b>BATCH COMMANDS</b>\n"
-                text += "• <b>/batchhelp</b> - Detailed batch guide\n"
-                text += "• <b>/validate</b> <i>entries</i> - Test format\n"
-                text += "• <b>/status</b> - System features\n\n"
-                
-                # Movement commands
-                text += "🔄 <b>STOCK MOVEMENTS</b>\n"
-                text += "• <b>/in</b> <i>item, qty unit, [details]</i>\n"
-                text += "• <b>/out</b> <i>item, qty unit, [details]</i>\n"
-                
-                # Simple example
-                text += "\n<b>Quick Example:</b>\n"
-                text += "<code>/in project: Bridge, cement, 50 bags</code>\n\n"
-                
-                # Batch example - most important feature
-                text += "<b>Batch Example:</b>\n"
-                text += "<code>/in project: Bridge\n"
-                text += "cement, 50 bags\n"
-                text += "steel bars, 10 pieces</code>\n\n"
-                
-                # Admin tools
-                if user_role == "admin":
-                    text += "⚙️ <b>ADMIN TOOLS</b>\n"
-                    text += "• <b>/adjust</b> <i>item, ±qty unit</i>\n"
-                    text += "• <b>/approve</b> <i>movement_id</i>\n"
-                    text += "• <b>/approvebatch</b> <i>batch_id</i>\n"
-                    text += "• <b>/rejectbatch</b> <i>batch_id</i>\n"
-                    text += "• <b>/setthreshold</b> <i>qty</i>\n\n"
-                
-                # Reporting tools
-                text += "📊 <b>REPORTS</b>\n"
+                text += "⚙️ <b>Management</b>\n"
+                text += "• <b>/approve</b> <i>movement_id</i> - Approve movement\n"
+                text += "• <b>/approvebatch</b> <i>batch_id</i> - Approve batch\n"
+                text += "• <b>/rejectbatch</b> <i>batch_id</i> - Reject batch\n"
+                text += "• <b>/setthreshold</b> <i>qty</i> - Set reorder level\n"
                 text += "• <b>/audit</b> - Low stock items\n"
                 text += "• <b>/export onhand</b> - CSV export\n\n"
             
+            # Batch Operations
+            if user_role in ["admin", "staff"]:
+                text += "📋 <b>Batch Operations</b>\n"
+                text += "• <b>/batchhelp</b> - Detailed batch guide\n"
+                text += "• <b>/validate</b> <i>entries</i> - Test format\n"
+                text += "• <b>/status</b> - System features\n\n"
+            
+            # Examples
+            text += "💡 <b>QUICK EXAMPLES</b>\n"
+            text += "• <code>/in project: Bridge, cement, 50 bags</code>\n"
+            text += "• <code>/stock cement</code>\n"
+            text += "• <code>/help stock</code> - Search help for stock commands\n\n"
+            
             # Pro tip
             text += "💡 <b>PRO TIP</b>\n"
-            text += "Use <b>global parameters</b> for batch commands:\n"
-            text += "<code>driver: name, project: name, from: location</code>"
+            text += "Use <b>/help [topic]</b> to search for specific commands.\n"
+            text += "Example: <code>/help batch</code> shows batch-related commands."
             
             return await self.send_message(chat_id, text)
             
         except Exception as e:
             logger.error(f"Error sending help message: {e}")
+            return False
+    
+    async def _send_filtered_help(self, chat_id: int, header_text: str, user_role: str, search_term: str) -> bool:
+        """Send filtered help message based on search term."""
+        try:
+            # Import the command suggestions service to get dynamic command data
+            from .services.command_suggestions import CommandSuggestionsService
+            cmd_service = CommandSuggestionsService()
+            
+            # Get commands by category
+            categories = {}
+            for category in cmd_service.get_all_categories():
+                commands = cmd_service.get_commands_by_category(category)
+                if commands:
+                    categories[category.lower()] = {
+                        "title": f"📦 {category}" if category == "Stock Operations" else
+                                f"🔍 {category}" if category == "Queries" else
+                                f"⚙️ {category}" if category == "Management" else
+                                f"📋 {category}" if category == "Batch Operations" else
+                                f"❓ {category}",
+                        "commands": [(f"/{cmd_name}", cmd_info["description"]) for cmd_name, cmd_info in commands]
+                    }
+            
+            # Find matching categories
+            matching_categories = []
+            for category_key, category_data in categories.items():
+                if (search_term in category_key or 
+                    any(search_term in cmd[0].lower() or search_term in cmd[1].lower() 
+                        for cmd in category_data["commands"])):
+                    matching_categories.append((category_key, category_data))
+            
+            if not matching_categories:
+                # No matches found
+                text = header_text + f"❌ No commands found matching \"{search_term}\"\n\n"
+                text += "💡 <b>Try these search terms:</b>\n"
+                text += "• <code>/help stock</code> - Stock operations\n"
+                text += "• <code>/help query</code> - Search commands\n"
+                text += "• <code>/help batch</code> - Batch operations\n"
+                text += "• <code>/help management</code> - Admin tools\n\n"
+                text += "Or use <code>/help</code> to see all commands."
+                return await self.send_message(chat_id, text)
+            
+            # Build filtered help message
+            text = header_text
+            
+            for category_key, category_data in matching_categories:
+                text += f"{category_data['title']}\n"
+                for cmd, description in category_data["commands"]:
+                    text += f"• <b>{cmd}</b> - {description}\n"
+                text += "\n"
+            
+            # Add footer
+            text += "💡 <b>Need more help?</b>\n"
+            text += "Use <code>/help</code> to see all available commands."
+            
+            return await self.send_message(chat_id, text)
+            
+        except Exception as e:
+            logger.error(f"Error sending filtered help message: {e}")
             return False
     
     async def send_error_message(self, chat_id: int, error_message: str) -> bool:
@@ -350,4 +532,17 @@ class TelegramService:
             return await self.send_message(chat_id, text)
         except Exception as e:
             logger.error(f"Error sending success message: {e}")
+            return False
+    
+    async def answer_callback_query(self, callback_query_id: str, text: str = None, show_alert: bool = False) -> bool:
+        """Answer a callback query to remove the loading state."""
+        try:
+            await self.bot.answer_callback_query(
+                callback_query_id=callback_query_id,
+                text=text,
+                show_alert=show_alert
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error answering callback query: {e}")
             return False

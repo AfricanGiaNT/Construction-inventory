@@ -20,9 +20,9 @@ class TestBatchStockServiceWithGlobalParams:
         mock_stock_service = MagicMock()
         
         # Configure stock service methods
-        mock_stock_service.stock_in = AsyncMock(return_value=(True, "Success"))
-        mock_stock_service.stock_out = AsyncMock(return_value=(True, "Success", None))
-        mock_stock_service.stock_adjust = AsyncMock(return_value=(True, "Success"))
+        mock_stock_service.stock_in = AsyncMock(return_value=(True, "Success", 100.0, 150.0))
+        mock_stock_service.stock_out = AsyncMock(return_value=(True, "Success", None, 100.0, 50.0))
+        mock_stock_service.stock_adjust = AsyncMock(return_value=(True, "Success", 100.0, 95.0))
         
         # Create service
         service = BatchStockService(mock_airtable, mock_settings, mock_stock_service)
@@ -137,7 +137,7 @@ class TestBatchStockServiceWithGlobalParams:
         # Mock the stock service to simulate validation error for missing project
         batch_stock_service.stock_service.stock_in.reset_mock()
         batch_stock_service.stock_service.stock_in.side_effect = [
-            (False, "Missing required project field")
+            (False, "Missing required project field", 100.0, 100.0)
         ]
         
         # Create test movement without project field

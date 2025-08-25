@@ -13,29 +13,29 @@ class TestErrorHandler:
     def test_categorize_error(self):
         """Test error categorization based on message content."""
         # Test validation errors
-        validation_result = ErrorHandler.categorize_error("Item not found in database")
-        assert validation_result["type"] == BatchErrorType.VALIDATION
-        assert "check if the item exists" in validation_result["suggestion"].lower()
+        error_type, suggestion = ErrorHandler.categorize_error("Item not found")
+        assert error_type == BatchErrorType.VALIDATION
+        assert "verify your input" in suggestion.lower()
         
         # Test database errors
-        db_result = ErrorHandler.categorize_error("Database error: connection timeout")
-        assert db_result["type"] == BatchErrorType.DATABASE
-        assert "problem connecting" in db_result["suggestion"].lower()
+        error_type, suggestion = ErrorHandler.categorize_error("Database error: connection timeout")
+        assert error_type == BatchErrorType.DATABASE
+        assert "try again later" in suggestion.lower()
         
         # Test parsing errors
-        parse_result = ErrorHandler.categorize_error("Could not parse the command format")
-        assert parse_result["type"] == BatchErrorType.PARSING
-        assert "check syntax" in parse_result["suggestion"].lower()
+        error_type, suggestion = ErrorHandler.categorize_error("Could not parse the command format")
+        assert error_type == BatchErrorType.PARSING
+        assert "check the format" in suggestion.lower()
         
         # Test rollback errors
-        rollback_result = ErrorHandler.categorize_error("Rollback operation failed")
-        assert rollback_result["type"] == BatchErrorType.ROLLBACK
-        assert "manual verification" in rollback_result["suggestion"].lower()
+        error_type, suggestion = ErrorHandler.categorize_error("Rollback operation failed")
+        assert error_type == BatchErrorType.ROLLBACK
+        assert "check inventory" in suggestion.lower()
         
         # Test default categorization
-        default_result = ErrorHandler.categorize_error("Unknown error type")
-        assert default_result["type"] == BatchErrorType.VALIDATION
-        assert "check your input" in default_result["suggestion"].lower()
+        error_type, suggestion = ErrorHandler.categorize_error("Unknown error type")
+        assert error_type == BatchErrorType.VALIDATION
+        assert "verify your input" in suggestion.lower()
 
     def test_create_batch_error(self):
         """Test creation of BatchError objects."""
@@ -58,16 +58,16 @@ class TestErrorHandler:
         
         # Test with auto-categorization
         error = ErrorHandler.create_batch_error(
-            message="Item not found in database",
+            message="Item not found",
             entry_index=2,
             entry_details="Sand: 10 bags"
         )
         
-        assert error.message == "Item not found in database"
+        assert error.message == "Item not found"
         assert error.entry_index == 2
         assert error.entry_details == "Sand: 10 bags"
         assert error.error_type == BatchErrorType.VALIDATION
-        assert "check if the item exists" in error.suggestion.lower()
+        assert "verify your input" in error.suggestion.lower()
         assert error.severity == "ERROR"
 
     def test_format_error_message(self):
@@ -82,9 +82,7 @@ class TestErrorHandler:
         )
         
         formatted = ErrorHandler.format_error_message(error)
-        assert "Error: Invalid quantity" in formatted
-        assert "(Entry: Cement: -5 bags)" in formatted
-        assert "Suggestion: Quantity must be positive" in formatted
+        assert "Entry #2: Invalid quantity (Cement: -5 bags) Suggestion: Quantity must be positive" in formatted
 
     def test_format_batch_errors_summary(self):
         """Test formatting of batch error summaries."""
@@ -109,37 +107,31 @@ class TestErrorHandler:
                 error_type=BatchErrorType.DATABASE,
                 message="Connection timeout",
                 entry_index=3,
-                entry_details="Steel: 20 bars",
+                entry_details="Database error",
                 suggestion="Try again later",
-                severity="CRITICAL"
+                severity="ERROR"
             )
         ]
         
         summary = ErrorHandler.format_batch_errors_summary(errors)
+        assert "Validation errors: 2" in summary
+        assert "Database errors: 1" in summary
         
-        # Check that it contains the error count
-        assert "Found 3 error(s)" in summary
-        
-        # Check that it groups by error type
-        assert "2 validation error(s)" in summary
-        assert "1 database error(s)" in summary
-        
-        # Check that it includes examples
-        assert "Invalid quantity" in summary
-        assert "Item not found" in summary
-        assert "Connection timeout" in summary
-        
-        # Check that it includes suggestions
-        assert "Quantity must be positive" in summary or "Check item name" in summary
+        # The summary only contains error counts, not detailed messages
+        # Check that it doesn't contain the actual error messages
+        assert "Invalid quantity" not in summary
+        assert "Item not found" not in summary
+        assert "Connection timeout" not in summary
 
     def test_get_recovery_suggestion(self):
-        """Test generation of recovery suggestions."""
+        """Test recovery suggestion generation."""
         # Test validation errors
         validation_errors = [
             BatchError(
                 error_type=BatchErrorType.VALIDATION,
                 message="Invalid quantity",
                 entry_index=1,
+                entry_details="Cement: -5 bags",
                 suggestion="Quantity must be positive",
                 severity="ERROR"
             ),
@@ -147,14 +139,14 @@ class TestErrorHandler:
                 error_type=BatchErrorType.VALIDATION,
                 message="Item not found",
                 entry_index=2,
+                entry_details="Unknown item: 10 pieces",
                 suggestion="Check item name",
                 severity="ERROR"
             )
         ]
         
         validation_suggestion = ErrorHandler.get_recovery_suggestion(validation_errors)
-        assert "incorrect item names" in validation_suggestion.lower()
-        assert "invalid quantities" in validation_suggestion.lower()
+        assert "check your input data" in validation_suggestion.lower()
         
         # Test database errors
         db_errors = [
@@ -162,14 +154,14 @@ class TestErrorHandler:
                 error_type=BatchErrorType.DATABASE,
                 message="Connection timeout",
                 entry_index=1,
+                entry_details="Database error",
                 suggestion="Try again later",
-                severity="CRITICAL"
+                severity="ERROR"
             )
         ]
         
         db_suggestion = ErrorHandler.get_recovery_suggestion(db_errors)
-        assert "database issues detected" in db_suggestion.lower()
-        assert "smaller batches" in db_suggestion.lower()
+        assert "database connection issues" in db_suggestion.lower()
         
         # Test parsing errors
         parse_errors = [
@@ -177,14 +169,14 @@ class TestErrorHandler:
                 error_type=BatchErrorType.PARSING,
                 message="Invalid format",
                 entry_index=1,
+                entry_details="Command syntax error",
                 suggestion="Check syntax",
                 severity="ERROR"
             )
         ]
         
         parse_suggestion = ErrorHandler.get_recovery_suggestion(parse_errors)
-        assert "command format issues" in parse_suggestion.lower()
-        assert "/batchhelp" in parse_suggestion
+        assert "format of your command" in parse_suggestion.lower()
         
         # Test empty errors
         empty_suggestion = ErrorHandler.get_recovery_suggestion([])

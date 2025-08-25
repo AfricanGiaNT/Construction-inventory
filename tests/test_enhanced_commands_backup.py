@@ -67,6 +67,14 @@ class TestEnhancedCommandHandlers:
             self.bot.batch_stock_service = self.mock_batch_stock_service
             self.bot.telegram_service = self.mock_telegram_service
             self.bot.command_router = self.mock_command_router
+            
+            # Mock the prepare_batch_approval method to return success
+            self.mock_batch_stock_service.prepare_batch_approval = AsyncMock(return_value=(True, "batch_123", Mock()))
+            
+            # Mock telegram service methods
+            self.mock_telegram_service.send_batch_approval_request = AsyncMock()
+            self.mock_telegram_service.send_message = AsyncMock()
+            self.mock_telegram_service.send_error_message = AsyncMock()
     
     def create_mock_command(self, command: str, args: list = None):
         """Create a mock command object."""
@@ -111,36 +119,29 @@ class TestEnhancedCommandHandlers:
         """Test the /batchhelp command."""
         command = self.create_mock_command("batchhelp")
         
-        # Mock the telegram service
-        self.mock_telegram_service.send_message = AsyncMock(return_value=True)
-        
         # Execute command
         await self.bot.execute_command(command, 12345, 67890, "Test User", UserRole.STAFF)
         
-        # Verify batch help was sent
+        # Verify that the batch help message was sent
         self.mock_telegram_service.send_message.assert_called_once()
         call_args = self.mock_telegram_service.send_message.call_args[0]
-        assert "Batch Command Help" in call_args[1]
-        assert "Newline Format" in call_args[1]
-        assert "Semicolon Format" in call_args[1]
+        assert "BATCH COMMAND GUIDE" in call_args[1]
+        assert "GLOBAL PARAMETERS" in call_args[1]
     
     @pytest.mark.asyncio
     async def test_status_command(self):
         """Test the /status command."""
         command = self.create_mock_command("status")
         
-        # Mock the telegram service
-        self.mock_telegram_service.send_message = AsyncMock(return_value=True)
-        
         # Execute command
         await self.bot.execute_command(command, 12345, 67890, "Test User", UserRole.STAFF)
         
-        # Verify status message was sent
+        # Verify that the status message was sent
         self.mock_telegram_service.send_message.assert_called_once()
         call_args = self.mock_telegram_service.send_message.call_args[0]
-        assert "System Status" in call_args[1]
-        assert "Batch Processing" in call_args[1]
-        assert "Available" in call_args[1]
+        assert "SYSTEM STATUS" in call_args[1]
+        assert "Bot:" in call_args[1]
+        assert "Database:" in call_args[1]
     
     @pytest.mark.asyncio
     async def test_enhanced_in_command_help(self):
@@ -215,21 +216,16 @@ class TestEnhancedCommandHandlers:
         # Mock NLP parser
         self.mock_nlp_parser.parse_batch_entries.return_value = batch_result
         
-        # Mock batch processing
-        mock_batch_process_result = Mock()
-        mock_batch_process_result.total_entries = 2
-        mock_batch_process_result.successful_entries = 2
-        mock_batch_process_result.failed_entries = 0
-        mock_batch_process_result.success_rate = 100.0
-        mock_batch_process_result.errors = []
-        mock_batch_process_result.rollback_performed = False
-        mock_batch_process_result.processing_time_seconds = 0.5
-        mock_batch_process_result.summary_message = "Batch processing successful"
+        # Mock batch approval preparation
+        mock_batch_approval = Mock()
+        mock_batch_approval.movements = movements
+        mock_batch_approval.before_levels = {"cement": 100, "steel bars": 200}
         
-        self.mock_batch_stock_service.process_batch_movements = AsyncMock(return_value=mock_batch_process_result)
+        self.mock_batch_stock_service.prepare_batch_approval = AsyncMock(return_value=(True, "batch_123", mock_batch_approval))
         
         # Mock telegram service
         self.mock_telegram_service.send_message = AsyncMock(return_value=True)
+        self.mock_telegram_service.send_batch_approval_request = AsyncMock(return_value=True)
         
         # Execute command
         await self.bot.execute_command(command, 12345, 67890, "Test User", UserRole.STAFF)
@@ -238,11 +234,11 @@ class TestEnhancedCommandHandlers:
         self.mock_telegram_service.send_message.assert_called()
         call_args = self.mock_telegram_service.send_message.call_args_list[0][0]
         assert "Batch Command Detected!" in call_args[1]
-        assert "Format: Newline" in call_args[1]
-        assert "Entries: 2 stock IN movements" in call_args[1]
+        assert "<b>Format:</b> Newline" in call_args[1]
+        assert "<b>Entries:</b> 2 stock IN movements" in call_args[1]
         
-        # Verify batch processing was called
-        self.mock_batch_stock_service.process_batch_movements.assert_called_once()
+        # Verify batch approval preparation was called
+        self.mock_batch_stock_service.prepare_batch_approval.assert_called_once()
     
     @pytest.mark.asyncio
     async def test_batch_out_command_with_confirmation(self):
@@ -259,21 +255,16 @@ class TestEnhancedCommandHandlers:
         # Mock NLP parser
         self.mock_nlp_parser.parse_batch_entries.return_value = batch_result
         
-        # Mock batch processing
-        mock_batch_process_result = Mock()
-        mock_batch_process_result.total_entries = 2
-        mock_batch_process_result.successful_entries = 2
-        mock_batch_process_result.failed_entries = 0
-        mock_batch_process_result.success_rate = 100.0
-        mock_batch_process_result.errors = []
-        mock_batch_process_result.rollback_performed = False
-        mock_batch_process_result.processing_time_seconds = 0.3
-        mock_batch_process_result.summary_message = "Batch processing successful"
+        # Mock batch approval preparation
+        mock_batch_approval = Mock()
+        mock_batch_approval.movements = movements
+        mock_batch_approval.before_levels = {"cement": 100, "steel bars": 200}
         
-        self.mock_batch_stock_service.process_batch_movements = AsyncMock(return_value=mock_batch_process_result)
+        self.mock_batch_stock_service.prepare_batch_approval = AsyncMock(return_value=(True, "batch_123", mock_batch_approval))
         
         # Mock telegram service
         self.mock_telegram_service.send_message = AsyncMock(return_value=True)
+        self.mock_telegram_service.send_batch_approval_request = AsyncMock(return_value=True)
         
         # Execute command
         await self.bot.execute_command(command, 12345, 67890, "Test User", UserRole.STAFF)
@@ -282,11 +273,11 @@ class TestEnhancedCommandHandlers:
         self.mock_telegram_service.send_message.assert_called()
         call_args = self.mock_telegram_service.send_message.call_args_list[0][0]
         assert "Batch Command Detected!" in call_args[1]
-        assert "Format: Semicolon" in call_args[1]
-        assert "Entries: 2 stock OUT movements" in call_args[1]
+        assert "<b>Format:</b> Semicolon" in call_args[1]
+        assert "<b>Entries:</b> 2 stock OUT movements" in call_args[1]
         
-        # Verify batch processing was called
-        self.mock_batch_stock_service.process_batch_movements.assert_called_once()
+        # Verify batch approval preparation was called
+        self.mock_batch_stock_service.prepare_batch_approval.assert_called_once()
     
     @pytest.mark.asyncio
     async def test_batch_adjust_command_with_confirmation(self):
@@ -298,26 +289,21 @@ class TestEnhancedCommandHandlers:
             self.create_mock_movement("cement", -5, MovementType.ADJUST),
             self.create_mock_movement("steel bars", -2, MovementType.ADJUST)
         ]
-        batch_result = self.create_mock_batch_result(BatchFormat.MIXED, movements)
+        batch_result = self.create_mock_batch_result(BatchFormat.NEWLINE, movements)
         
         # Mock NLP parser
         self.mock_nlp_parser.parse_batch_entries.return_value = batch_result
         
-        # Mock batch processing
-        mock_batch_process_result = Mock()
-        mock_batch_process_result.total_entries = 2
-        mock_batch_process_result.successful_entries = 2
-        mock_batch_process_result.failed_entries = 0
-        mock_batch_process_result.success_rate = 100.0
-        mock_batch_process_result.errors = []
-        mock_batch_process_result.rollback_performed = False
-        mock_batch_process_result.processing_time_seconds = 0.4
-        mock_batch_process_result.summary_message = "Batch processing successful"
+        # Mock batch approval preparation
+        mock_batch_approval = Mock()
+        mock_batch_approval.movements = movements
+        mock_batch_approval.before_levels = {"cement": 100, "steel bars": 200}
         
-        self.mock_batch_stock_service.process_batch_movements = AsyncMock(return_value=mock_batch_process_result)
+        self.mock_batch_stock_service.prepare_batch_approval = AsyncMock(return_value=(True, "batch_123", mock_batch_approval))
         
         # Mock telegram service
         self.mock_telegram_service.send_message = AsyncMock(return_value=True)
+        self.mock_telegram_service.send_batch_approval_request = AsyncMock(return_value=True)
         
         # Execute command
         await self.bot.execute_command(command, 12345, 67890, "Test User", UserRole.ADMIN)
@@ -326,39 +312,46 @@ class TestEnhancedCommandHandlers:
         self.mock_telegram_service.send_message.assert_called()
         call_args = self.mock_telegram_service.send_message.call_args_list[0][0]
         assert "Batch Command Detected!" in call_args[1]
-        assert "Format: Mixed" in call_args[1]
-        assert "Entries: 2 stock ADJUST movements" in call_args[1]
+        assert "<b>Format:</b> Newline" in call_args[1]
+        assert "<b>Entries:</b> 2 stock ADJUST movements" in call_args[1]
         
-        # Verify batch processing was called
-        self.mock_batch_stock_service.process_batch_movements.assert_called_once()
+        # Verify batch approval preparation was called
+        self.mock_batch_stock_service.prepare_batch_approval.assert_called_once()
     
     @pytest.mark.asyncio
     async def test_single_entry_fallback(self):
-        """Test that single entries still work exactly as before."""
+        """Test that single entries fall back to single-entry approval flow."""
         command = self.create_mock_command("in", ["cement, 50 bags, from supplier"])
         
-        # Create mock single entry result
-        movement = self.create_mock_movement("cement", 50, MovementType.IN)
-        batch_result = self.create_mock_batch_result(BatchFormat.SINGLE, [movement])
+        # Create mock batch result for single entry
+        movements = [self.create_mock_movement("cement", 50, MovementType.IN)]
+        batch_result = self.create_mock_batch_result(BatchFormat.SINGLE, movements)
         
         # Mock NLP parser
         self.mock_nlp_parser.parse_batch_entries.return_value = batch_result
         
-        # Mock stock service
-        self.mock_stock_service.stock_in = AsyncMock(return_value=(True, "Stock in successful"))
+        # Mock batch approval preparation
+        mock_batch_approval = Mock()
+        mock_batch_approval.movements = movements
+        mock_batch_approval.before_levels = {"cement": 100}
+        
+        self.mock_batch_stock_service.prepare_batch_approval = AsyncMock(return_value=(True, "batch_123", mock_batch_approval))
         
         # Mock telegram service
-        self.mock_telegram_service.send_success_message = AsyncMock(return_value=True)
+        self.mock_telegram_service.send_message = AsyncMock(return_value=True)
+        self.mock_telegram_service.send_batch_approval_request = AsyncMock(return_value=True)
         
         # Execute command
         await self.bot.execute_command(command, 12345, 67890, "Test User", UserRole.STAFF)
         
-        # Verify single entry was processed normally
-        self.mock_stock_service.stock_in.assert_called_once()
-        self.mock_telegram_service.send_success_message.assert_called_once()
+        # Verify single entry approval was sent
+        self.mock_telegram_service.send_message.assert_called()
+        call_args = self.mock_telegram_service.send_message.call_args_list[0][0]
+        assert "Entry submitted for approval" in call_args[1]
+        assert "cement" in call_args[1]
         
-        # Verify batch service was NOT called
-        self.mock_batch_stock_service.process_batch_movements.assert_not_called()
+        # Verify batch approval preparation was called
+        self.mock_batch_stock_service.prepare_batch_approval.assert_called_once()
     
     @pytest.mark.asyncio
     async def test_help_command_includes_batchhelp(self):

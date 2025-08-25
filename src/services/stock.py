@@ -1,7 +1,7 @@
 """Stock management service for the Construction Inventory Bot."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Optional, Tuple
 
 from ..schemas import Item, StockMovement, MovementType, MovementStatus, UserRole

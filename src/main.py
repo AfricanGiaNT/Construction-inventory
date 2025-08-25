@@ -4,7 +4,7 @@ import logging
 import asyncio
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Dict, Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -18,6 +18,9 @@ from .services.stock import StockService
 from .services.batch_stock import BatchStockService
 from .services.approvals import ApprovalService
 from .services.queries import QueryService
+from .services.stock_query import StockQueryService
+from .services.keyboard_management import KeyboardManagementService
+from .services.command_suggestions import CommandSuggestionsService
 from .telegram_service import TelegramService
 from .health import init_health_checker
 
@@ -63,6 +66,9 @@ class ConstructionInventoryBot:
         # Initialize approval service with batch_stock_service
         self.approval_service = ApprovalService(self.airtable_client, self.batch_stock_service)
         self.query_service = QueryService(self.airtable_client)
+        self.stock_query_service = StockQueryService(self.airtable_client)
+        self.keyboard_management_service = KeyboardManagementService(expiry_hours=1, max_clicks_per_minute=10)
+        self.command_suggestions_service = CommandSuggestionsService()
         self.telegram_service = TelegramService(self.settings)
         
         # Initialize scheduler
@@ -76,6 +82,15 @@ class ConstructionInventoryBot:
         
         # Initialize health checker
         init_health_checker(self)
+        
+        # Initialize monitoring and debugging
+        self.monitoring_stats = {
+            'commands_processed': 0,
+            'callback_queries_processed': 0,
+            'errors_encountered': 0,
+            'start_time': datetime.now(UTC),
+            'last_cleanup': datetime.now(UTC)
+        }
         
         logger.info("Construction Inventory Bot initialized successfully")
     
@@ -98,6 +113,14 @@ class ConstructionInventoryBot:
                 self.send_weekly_backup,
                 CronTrigger(day_of_week=0, hour=9, minute=0),  # Monday 9:00 AM
                 id="weekly_backup",
+                replace_existing=True
+            )
+            
+            # Schedule keyboard cleanup (every 15 minutes)
+            self.scheduler.add_job(
+                self.cleanup_expired_keyboards,
+                CronTrigger(minute="*/15"),  # Every 15 minutes
+                id="keyboard_cleanup",
                 replace_existing=True
             )
             
@@ -311,6 +334,10 @@ class ConstructionInventoryBot:
                 else:
                     await self.telegram_service.send_error_message(chat_id, message)
             
+            elif data.startswith("stock_item_"):
+                # Handle stock item selection from inline keyboard
+                await self.handle_stock_keyboard_callback(callback_query)
+            
             else:
                 # Unknown callback type
                 await self.bot.answer_callback_query(
@@ -336,6 +363,7 @@ class ConstructionInventoryBot:
         try:
             # Handle callback queries from inline buttons
             if hasattr(update, 'callback_query') and update.callback_query:
+                self.monitoring_stats['callback_queries_processed'] += 1
                 await self.process_callback_query(update.callback_query)
                 return
             
@@ -355,41 +383,46 @@ class ConstructionInventoryBot:
             update_id = update.update_id
             
             # Check if this is a command
-            if not text.startswith("/"):
+            if text.startswith("/"):
+                self.monitoring_stats['commands_processed'] += 1
+                logger.info(f"Processing command: {text} from user {user_name} ({user_id}) in chat {chat_id}")
+                
+                # Create user if they don't exist FIRST (before permission check)
+                logger.info(f"Attempting to create user {user_id} ({user_name}) if they don't exist...")
+                user_created = await self.airtable_client.create_user_if_not_exists(user_id, username, user_name, chat_id=chat_id)
+                logger.info(f"User creation result: {user_created}")
+                
+                # Now validate user access (after user creation)
+                access_valid, access_message, user_role = await self.auth_service.validate_user_access(
+                    user_id, chat_id, text.split()[0][1:]  # Remove leading slash
+                )
+                
+                if not access_valid:
+                    await self.telegram_service.send_error_message(chat_id, access_message)
+                    return
+                
+                # Debug log for command text
+                logger.info(f"DEBUG - Command text before routing: '{text}'")
+                
+                # Route and execute command
+                command, error = await self.command_router.route_command(
+                    text, chat_id, user_id, user_name, message_id, update_id
+                )
+                
+                if error:
+                    await self.telegram_service.send_error_message(chat_id, error)
+                    return
+                
+                # Execute command
+                await self.execute_command(command, chat_id, user_id, user_name, user_role)
+                
+            else:
+                # Command-only system: ignore all non-command messages
+                logger.debug(f"Ignoring non-command message: '{text}' from user {user_name} ({user_id}) in chat {chat_id}")
                 return
-            
-            logger.info(f"Processing command: {text} from user {user_name} ({user_id}) in chat {chat_id}")
-            
-            # Create user if they don't exist FIRST (before permission check)
-            logger.info(f"Attempting to create user {user_id} ({user_name}) if they don't exist...")
-            user_created = await self.airtable_client.create_user_if_not_exists(user_id, username, user_name, chat_id=chat_id)
-            logger.info(f"User creation result: {user_created}")
-            
-            # Now validate user access (after user creation)
-            access_valid, access_message, user_role = await self.auth_service.validate_user_access(
-                user_id, chat_id, text.split()[0][1:]  # Remove leading slash
-            )
-            
-            if not access_valid:
-                await self.telegram_service.send_error_message(chat_id, access_message)
-                return
-            
-            # Debug log for command text
-            logger.info(f"DEBUG - Command text before routing: '{text}'")
-            
-            # Route and execute command
-            command, error = await self.command_router.route_command(
-                text, chat_id, user_id, user_name, message_id, update_id
-            )
-            
-            if error:
-                await self.telegram_service.send_error_message(chat_id, error)
-                return
-            
-            # Execute command
-            await self.execute_command(command, chat_id, user_id, user_name, user_role)
             
         except Exception as e:
+            self.monitoring_stats['errors_encountered'] += 1
             logger.error(f"Error processing update: {e}")
     
     async def execute_command(self, command, chat_id: int, user_id: int, 
@@ -400,13 +433,54 @@ class ConstructionInventoryBot:
             args = command.args
             
             if cmd == "help":
-                await self.telegram_service.send_help_message(chat_id, user_role.value)
+                # Handle searchable help: /help [topic]
+                search_term = args[0] if args else None
+                await self.telegram_service.send_help_message(chat_id, user_role.value, search_term)
+                
+            elif cmd == "quickhelp":
+                # Quick help for specific command: /quickhelp [command]
+                if not args:
+                    await self.telegram_service.send_message(
+                        chat_id,
+                        "📖 <b>Quick Help</b>\n\n"
+                        "Get quick help for a specific command.\n\n"
+                        "<b>Usage:</b>\n"
+                        "/quickhelp <command_name>\n\n"
+                        "<b>Examples:</b>\n"
+                        "/quickhelp stock\n"
+                        "/quickhelp in\n"
+                        "/quickhelp batchhelp\n\n"
+                        "💡 Use <code>/help</code> to see all commands."
+                    )
+                    return
+                
+                command_name = args[0].lower()
+                quick_help = self.command_suggestions_service.get_quick_help(command_name)
+                
+                if quick_help:
+                    await self.telegram_service.send_message(chat_id, quick_help)
+                else:
+                    # Command not found, suggest similar commands
+                    suggestions = self.command_suggestions_service.get_command_suggestions(command_name)
+                    if suggestions:
+                        suggestions_message = self.command_suggestions_service.format_suggestions_message(command_name, suggestions)
+                        await self.telegram_service.send_message(chat_id, suggestions_message)
+                    else:
+                        await self.telegram_service.send_error_message(
+                            chat_id,
+                            f"❌ <b>Command not found: /{command_name}</b>\n\n"
+                            "Use <code>/help</code> to see all available commands."
+                        )
                 
             elif cmd == "batchhelp":
                 await self.send_batch_help_message(chat_id, user_role.value)
                 
             elif cmd == "status":
                 await self.send_system_status_message(chat_id, user_role.value)
+                
+            elif cmd == "monitor":
+                # Show monitoring and debugging information
+                await self.send_monitoring_info(chat_id, user_role.value)
                 
             elif cmd == "validate":
                 if not args:
@@ -431,6 +505,28 @@ class ConstructionInventoryBot:
                 logger.info(f"DEBUG - Processing validate command with text: '{full_text}'")
                 
                 await self.handle_validate_command(chat_id, user_id, user_name, full_text)
+                
+            elif cmd == "stock":
+                if not args:
+                    await self.telegram_service.send_message(
+                        chat_id,
+                        "🔍 <b>Stock Query</b>\n\n"
+                        "This command allows you to search for items and view their stock levels.\n\n"
+                        "<b>Usage:</b>\n"
+                        "/stock <item_name>\n\n"
+                        "<b>Examples:</b>\n"
+                        "/stock cement\n"
+                        "/stock m24 bolts\n"
+                        "/stock safety helmets\n\n"
+                        "The search will find items with similar names and show you options to choose from."
+                    )
+                    return
+                
+                # Process the stock query
+                query = args[0] if len(args) == 1 else " ".join(args)
+                logger.info(f"Processing stock query: '{query}' for user {user_name}")
+                
+                await self.handle_stock_command(chat_id, user_id, user_name, query)
                 
             elif cmd == "whoami":
                 await self.telegram_service.send_message(
@@ -877,7 +973,23 @@ class ConstructionInventoryBot:
                     await self.telegram_service.send_error_message(chat_id, "Usage: /export onhand")
                     
             else:
-                await self.telegram_service.send_error_message(chat_id, f"Unknown command: /{cmd}")
+                # Use command suggestions service for unknown commands
+                suggestions = self.command_suggestions_service.get_command_suggestions(cmd)
+                if suggestions:
+                    # Send helpful suggestions
+                    suggestions_message = self.command_suggestions_service.format_suggestions_message(cmd, suggestions)
+                    await self.telegram_service.send_message(chat_id, suggestions_message)
+                else:
+                    # No suggestions found, send generic help
+                    help_text = f"❌ <b>Unknown Command: /{cmd}</b>\n\n"
+                    help_text += "💡 <b>Available Commands:</b>\n"
+                    help_text += "• <b>/help</b> - Show all commands\n"
+                    help_text += "• <b>/help [topic]</b> - Search commands by topic\n"
+                    help_text += "• <b>/stock [item]</b> - Search inventory\n"
+                    help_text += "• <b>/in [item, qty unit]</b> - Add stock\n"
+                    help_text += "• <b>/out [item, qty unit]</b> - Remove stock\n\n"
+                    help_text += "Use <code>/help</code> to see all available commands."
+                    await self.telegram_service.send_error_message(chat_id, help_text)
                 
         except Exception as e:
             logger.error(f"Error executing command {command.command}: {e}")
@@ -1098,6 +1210,183 @@ class ConstructionInventoryBot:
         
         await self.telegram_service.send_message(chat_id, validation_text)
 
+    async def handle_stock_command(self, chat_id: int, user_id: int, user_name: str, query: str):
+        """Handle /stock command for querying item stock levels."""
+        try:
+            logger.info(f"Processing stock query: '{query}' for user {user_name}")
+            
+            # Perform fuzzy search
+            search_results = await self.stock_query_service.fuzzy_search_items(query, limit=5)
+            
+            if not search_results:
+                # No results found
+                await self.telegram_service.send_message(
+                    chat_id,
+                    f"🔍 <b>Stock Query Results</b>\n\n"
+                    f"<b>Search:</b> {query}\n\n"
+                    f"❌ <b>No items found</b>\n\n"
+                    f"<i>Try searching with different keywords or check the spelling.</i>"
+                )
+                return
+            
+            # Collect pending information for each item
+            pending_info = {}
+            for item in search_results:
+                pending_movements = await self.stock_query_service.get_pending_movements(item.name)
+                in_pending_batch = await self.stock_query_service.is_in_pending_batch(item.name)
+                
+                pending_info[item.name] = {
+                    'pending_movements': len(pending_movements),
+                    'in_pending_batch': in_pending_batch
+                }
+            
+            # Get total count of matching items for "Showing top 3 of X" message
+            total_count = await self.stock_query_service.get_total_matching_items_count(query)
+            
+            # Send search results
+            await self.telegram_service.send_stock_search_results(
+                chat_id, query, search_results, pending_info, total_count
+            )
+            
+            # Store search results for user confirmation
+            # We'll store this in a simple in-memory cache for now
+            # In production, this could be stored in Redis or database
+            if not hasattr(self, '_stock_search_cache'):
+                self._stock_search_cache = {}
+            
+            # Store results with timestamp and user info
+            cache_key = f"{chat_id}_{user_id}"
+            self._stock_search_cache[cache_key] = {
+                'query': query,
+                'results': search_results,
+                'pending_info': pending_info,
+                'timestamp': datetime.now(),
+                'user_name': user_name
+            }
+            
+            # Debug logging
+            logger.info(f"Stored stock search cache for key: {cache_key}")
+            logger.info(f"Cache now contains {len(self._stock_search_cache)} entries")
+            logger.info(f"Cache keys: {list(self._stock_search_cache.keys())}")
+            
+            # Clean up old cache entries (older than 1 hour)
+            self._cleanup_stock_search_cache()
+            
+        except Exception as e:
+            logger.error(f"Error handling stock command: {e}")
+            error_text = (
+                "❌ <b>Stock Query Error</b>\n\n"
+                f"An error occurred while processing your stock query: {str(e)}\n\n"
+                "Please try again or contact support if the problem persists."
+            )
+            await self.telegram_service.send_message(chat_id, error_text)
+
+    def _cleanup_stock_search_cache(self):
+        """Clean up old stock search cache entries."""
+        try:
+            if not hasattr(self, '_stock_search_cache'):
+                return
+            
+            current_time = datetime.now()
+            keys_to_remove = []
+            
+            for cache_key, cache_data in self._stock_search_cache.items():
+                # Remove entries older than 1 hour
+                if (current_time - cache_data['timestamp']).total_seconds() > 3600:
+                    keys_to_remove.append(cache_key)
+            
+            for key in keys_to_remove:
+                del self._stock_search_cache[key]
+                
+            if keys_to_remove:
+                logger.info(f"Cleaned up {len(keys_to_remove)} old stock search cache entries")
+                
+        except Exception as e:
+            logger.error(f"Error cleaning up stock search cache: {e}")
+
+    async def handle_stock_confirmation(self, chat_id: int, user_id: int, user_name: str, confirmation: str):
+        """Handle user confirmation of stock item selection."""
+        try:
+            logger.info(f"Processing stock confirmation: '{confirmation}' for user {user_name}")
+            
+            # Get cached search results
+            cache_key = f"{chat_id}_{user_id}"
+            if not hasattr(self, '_stock_search_cache') or cache_key not in self._stock_search_cache:
+                await self.telegram_service.send_message(
+                    chat_id,
+                    "❌ <b>No Recent Search</b>\n\n"
+                    "Please perform a stock search first using /stock <item_name>"
+                )
+                return
+            
+            cache_data = self._stock_search_cache[cache_key]
+            search_results = cache_data['results']
+            pending_info = cache_data['pending_info']
+            
+            # Parse confirmation (could be number or exact name)
+            selected_item = None
+            
+            # Try to parse as number first
+            try:
+                item_number = int(confirmation)
+                if 1 <= item_number <= len(search_results):
+                    selected_item = search_results[item_number - 1]  # Convert to 0-based index
+                    logger.info(f"User selected item {item_number}: {selected_item.name}")
+                else:
+                    await self.telegram_service.send_message(
+                        chat_id,
+                        f"❌ <b>Invalid Selection</b>\n\n"
+                        f"Please select a number between 1 and {len(search_results)}"
+                    )
+                    return
+            except ValueError:
+                # Not a number, try to find by exact name
+                confirmation_lower = confirmation.lower().strip()
+                for item in search_results:
+                    if item.name.lower() == confirmation_lower:
+                        selected_item = item
+                        logger.info(f"User confirmed item by name: {item.name}")
+                        break
+                
+                if not selected_item:
+                    # Try fuzzy matching for close names
+                    for item in search_results:
+                        if confirmation_lower in item.name.lower() or item.name.lower() in confirmation_lower:
+                            selected_item = item
+                            logger.info(f"User confirmed item by partial name match: {item.name}")
+                            break
+                    
+                    if not selected_item:
+                        await self.telegram_service.send_message(
+                            chat_id,
+                            f"❌ <b>Item Not Found</b>\n\n"
+                            f"Could not find an item matching '{confirmation}' in your recent search results.\n\n"
+                            f"<b>Available options:</b>\n" + 
+                            "\n".join([f"{i+1}. {item.name}" for i, item in enumerate(search_results)])
+                        )
+                        return
+            
+            # Get detailed information for the selected item
+            pending_movements = await self.stock_query_service.get_pending_movements(selected_item.name)
+            in_pending_batch = await self.stock_query_service.is_in_pending_batch(selected_item.name)
+            
+            # Send detailed item information
+            await self.telegram_service.send_item_details(
+                chat_id, selected_item, pending_movements, in_pending_batch
+            )
+            
+            # Clear the cache for this user
+            del self._stock_search_cache[cache_key]
+            
+        except Exception as e:
+            logger.error(f"Error handling stock confirmation: {e}")
+            error_text = (
+                "❌ <b>Stock Confirmation Error</b>\n\n"
+                f"An error occurred while processing your confirmation: {str(e)}\n\n"
+                "Please try again or contact support if the problem persists."
+            )
+            await self.telegram_service.send_message(chat_id, error_text)
+
     async def send_batch_help_message(self, chat_id: int, user_role: str):
         """Send concise help message for batch commands."""
         text = "📦 <b>BATCH COMMAND GUIDE</b>\n\n"
@@ -1233,6 +1522,211 @@ class ConstructionInventoryBot:
                 
         except Exception as e:
             logger.error(f"Error sending weekly backup: {e}")
+    
+    async def handle_stock_keyboard_callback(self, callback_query):
+        """Handle inline keyboard callbacks for stock item selection with smart management."""
+        try:
+            # Extract callback data
+            callback_data = callback_query.data
+            user_id = callback_query.from_user.id
+            chat_id = callback_query.message.chat.id
+            
+            logger.info(f"Processing stock keyboard callback: {callback_data} from user {user_id}")
+            
+            # Parse callback data: "stock_item_{index}_{item_name_slug}"
+            if not callback_data.startswith("stock_item_"):
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id, 
+                    "❌ Invalid callback data"
+                )
+                return
+            
+            try:
+                # Parse callback data: "stock_item_{index}_{item_name_slug}"
+                # The item_name_slug may contain underscores, so we need to be careful
+                if not callback_data.startswith("stock_item_"):
+                    raise ValueError("Invalid callback data format")
+                
+                # Remove "stock_item_" prefix
+                remaining = callback_data[11:]  # len("stock_item_") = 11
+                
+                # Find the first underscore after the prefix
+                underscore_pos = remaining.find("_")
+                if underscore_pos == -1:
+                    raise ValueError("Invalid callback data format")
+                
+                # Extract index and item name slug
+                item_index = int(remaining[:underscore_pos]) - 1  # Convert to 0-based index
+                item_name_slug = remaining[underscore_pos + 1:]
+                
+                # Debug logging
+                logger.info(f"Parsed callback data: index={item_index}, item_name_slug='{item_name_slug}'")
+                
+                # Validate item_index is a number
+                if item_index < 0:
+                    raise ValueError("Invalid item index")
+                
+            except (ValueError, IndexError):
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id, 
+                    "❌ Invalid callback data format"
+                )
+                return
+            
+            # Temporarily bypass rate limiting for stock queries to test functionality
+            # TODO: Implement proper rate limiting for stock queries
+            logger.info(f"Bypassing rate limiting for stock query callback")
+            
+            # Get cached search results
+            cache_key = f"{chat_id}_{user_id}"
+            logger.info(f"Looking for cache key: {cache_key}")
+            logger.info(f"Cache exists: {hasattr(self, '_stock_search_cache')}")
+            if hasattr(self, '_stock_search_cache'):
+                logger.info(f"Cache contains {len(self._stock_search_cache)} entries")
+                logger.info(f"Cache keys: {list(self._stock_search_cache.keys())}")
+            
+            if not hasattr(self, '_stock_search_cache') or cache_key not in self._stock_search_cache:
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id, 
+                    "❌ No recent search found. Please search again."
+                )
+                return
+            
+            cache_data = self._stock_search_cache[cache_key]
+            search_results = cache_data['results']
+            pending_info = cache_data['pending_info']
+            
+            logger.info(f"Cache data retrieved: {len(search_results)} results, pending_info: {pending_info}")
+            logger.info(f"Item index requested: {item_index}, available items: {[item.name for item in search_results]}")
+            
+            # Validate item index
+            if item_index < 0 or item_index >= len(search_results):
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id, 
+                    "❌ Invalid item selection"
+                )
+                return
+            
+            # Get selected item
+            selected_item = search_results[item_index]
+            logger.info(f"Selected item: {selected_item.name}")
+            
+            # Get pending movements and batch status for the selected item
+            logger.info(f"Getting pending movements for item: {selected_item.name}")
+            pending_movements = await self.stock_query_service.get_pending_movements(selected_item.name)
+            logger.info(f"Found {len(pending_movements)} pending movements")
+            
+            logger.info(f"Checking if item is in pending batch: {selected_item.name}")
+            in_pending_batch = await self.stock_query_service.is_in_pending_batch(selected_item.name)
+            logger.info(f"Item in pending batch: {in_pending_batch}")
+            
+            # Send detailed item information
+            await self.telegram_service.send_item_details(
+                chat_id, selected_item, pending_movements, in_pending_batch
+            )
+            
+            # Answer callback query to remove loading state
+            await self.telegram_service.answer_callback_query(
+                callback_query.id, 
+                f"✅ Showing details for {selected_item.name}"
+            )
+            
+            logger.info(f"Successfully processed keyboard callback for item: {selected_item.name}")
+            
+        except Exception as e:
+            logger.error(f"Error handling stock keyboard callback: {e}")
+            try:
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id, 
+                    "❌ Error processing selection. Please try again."
+                )
+            except:
+                pass  # Ignore errors in error handling
+    
+    async def cleanup_expired_keyboards(self):
+        """Clean up expired keyboards (scheduled task)."""
+        try:
+            cleaned_count = self.keyboard_management_service.cleanup_expired_keyboards()
+            if cleaned_count > 0:
+                logger.info(f"Cleaned up {cleaned_count} expired keyboards")
+            
+            # Log keyboard statistics periodically
+            stats = self.keyboard_management_service.get_keyboard_stats()
+            if stats:
+                logger.debug(f"Keyboard stats: {stats['active_keyboards']} active, {stats['expired_keyboards']} expired")
+            
+            # Update monitoring stats
+            self.monitoring_stats['last_cleanup'] = datetime.now(UTC)
+                
+        except Exception as e:
+            logger.error(f"Error cleaning up expired keyboards: {e}")
+    
+    async def send_monitoring_info(self, chat_id: int, user_role: str):
+        """Send monitoring and debugging information."""
+        try:
+            if user_role not in ["admin", "staff"]:
+                await self.telegram_service.send_error_message(
+                    chat_id, 
+                    "❌ <b>Access Denied</b>\n\nOnly staff and admin users can access monitoring information."
+                )
+                return
+            
+            # Get current time
+            current_time = datetime.now(UTC)
+            uptime = current_time - self.monitoring_stats['start_time']
+            
+            # Get keyboard management stats
+            keyboard_stats = self.keyboard_management_service.get_keyboard_stats()
+            
+            # Build monitoring message
+            text = "📊 <b>SYSTEM MONITORING</b>\n\n"
+            
+            # System status
+            text += "🖥️ <b>System Status</b>\n"
+            text += f"• Uptime: {uptime.days}d {uptime.seconds // 3600}h {(uptime.seconds % 3600) // 60}m\n"
+            text += f"• Last cleanup: {self.monitoring_stats['last_cleanup'].strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n"
+            
+            # Activity statistics
+            text += "📈 <b>Activity Statistics</b>\n"
+            text += f"• Commands processed: {self.monitoring_stats['commands_processed']}\n"
+            text += f"• Callback queries: {self.monitoring_stats['callback_queries_processed']}\n"
+            text += f"• Errors encountered: {self.monitoring_stats['errors_encountered']}\n\n"
+            
+            # Keyboard management stats
+            if keyboard_stats:
+                text += "⌨️ <b>Keyboard Management</b>\n"
+                text += f"• Active keyboards: {keyboard_stats.get('active_keyboards', 0)}\n"
+                text += f"• Expired keyboards: {keyboard_stats.get('expired_keyboards', 0)}\n"
+                text += f"• Total keyboards: {keyboard_stats.get('total_keyboards', 0)}\n\n"
+            
+            # Performance metrics
+            text += "⚡ <b>Performance Metrics</b>\n"
+            text += f"• Commands per hour: {self.monitoring_stats['commands_processed'] / max(uptime.total_seconds() / 3600, 1):.1f}\n"
+            text += f"• Error rate: {(self.monitoring_stats['errors_encountered'] / max(self.monitoring_stats['commands_processed'], 1)) * 100:.2f}%\n\n"
+            
+            # Health status
+            text += "💚 <b>Health Status</b>\n"
+            error_rate = (self.monitoring_stats['errors_encountered'] / max(self.monitoring_stats['commands_processed'], 1)) * 100
+            if error_rate < 1:
+                text += "• System: 🟢 Healthy\n"
+            elif error_rate < 5:
+                text += "• System: 🟡 Warning\n"
+            else:
+                text += "• System: 🔴 Critical\n"
+            
+            text += "💡 <b>Useful Commands:</b>\n"
+            text += "• <code>/status</code> - System features\n"
+            text += "• <code>/help</code> - Available commands\n"
+            text += "• <code>/monitor</code> - This monitoring info"
+            
+            await self.telegram_service.send_message(chat_id, text)
+            
+        except Exception as e:
+            logger.error(f"Error sending monitoring info: {e}")
+            await self.telegram_service.send_error_message(
+                chat_id, 
+                f"❌ <b>Error</b>\n\nFailed to retrieve monitoring information: {str(e)}"
+            )
 
 
 async def main():

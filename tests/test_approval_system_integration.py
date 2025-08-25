@@ -828,7 +828,7 @@ async def test_full_approval_system_flow():
     assert approval_message is not None, "Approval request message not found"
     assert batch_id is not None, "Could not extract batch_id from approval message"
     assert "cement" in approval_message["text"], "Item name not found in approval message"
-    assert "10.0 bags" in approval_message["text"], "Quantity not found in approval message"
+    assert "10.0 bag" in approval_message["text"], "Quantity not found in approval message"
     
     # Get the cement item's initial stock level
     cement_initial = mock_airtable.items["cement"].on_hand

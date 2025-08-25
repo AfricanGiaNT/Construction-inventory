@@ -75,7 +75,7 @@ class TestAirtableIntegrationWithGlobalParams:
         call_args = airtable_client.movements_table.create.call_args[0][0]
         
         # Check that project field was included
-        assert call_args["Project"] == "Bridge Construction"
+        assert call_args["From/To Project"] == "Bridge Construction"
 
     @pytest.mark.asyncio
     async def test_create_movement_with_all_global_params(self, airtable_client):
@@ -110,7 +110,7 @@ class TestAirtableIntegrationWithGlobalParams:
         # Check that all global parameters were included
         assert call_args["Driver's Name"] == "Mr Longwe"
         assert call_args["From/To Location"] == "chigumula office"
-        assert call_args["Project"] == "Bridge Construction"
+        assert call_args["From/To Project"] == "Bridge Construction"
 
     @pytest.mark.asyncio
     async def test_create_movement_without_project(self, airtable_client):
@@ -142,4 +142,4 @@ class TestAirtableIntegrationWithGlobalParams:
         call_args = airtable_client.movements_table.create.call_args[0][0]
         
         # Check that project field was not included
-        assert "Project" not in call_args
+        assert "From/To Project" not in call_args
