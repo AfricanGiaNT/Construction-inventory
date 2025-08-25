@@ -126,7 +126,7 @@ async def test_send_batch_approval_request(telegram_service):
 
 @pytest.mark.asyncio
 async def test_send_batch_approval_request_many_items(telegram_service):
-    """Test sending a batch approval request with many items (pagination test)."""
+    """Test sending a batch approval request with many items (all items displayed)."""
     # Create 15 test movements
     movements = []
     for i in range(15):
@@ -158,13 +158,60 @@ async def test_send_batch_approval_request_many_items(telegram_service):
     message = telegram_service.bot.sent_messages[0]
     assert "<b>Items to process:</b> 15" in message["text"]
     
-    # Verify only 10 items are listed and there's a "more items" message
+    # Verify all items are listed (no more pagination limit)
     assert "item_0" in message["text"]
     assert "item_9" in message["text"]
-    assert "... and 5 more items" in message["text"]
+    assert "item_10" in message["text"]
+    assert "item_14" in message["text"]  # Last item (15th item, 0-indexed)
     
-    # Verify item_10 is not in the message (pagination worked)
-    assert "item_10" not in message["text"]
+    # Verify no "more items" message since all items are shown
+    assert "... and" not in message["text"]
+
+
+@pytest.mark.asyncio
+async def test_send_batch_approval_request_max_items(telegram_service):
+    """Test sending a batch approval request with maximum batch size (40 items)."""
+    # Create 40 test movements (maximum batch size)
+    movements = []
+    for i in range(40):
+        movements.append(
+            StockMovement(
+                item_name=f"max_item_{i}",
+                movement_type=MovementType.IN,
+                quantity=10.0,
+                unit="pieces",
+                signed_base_quantity=10.0,
+                user_id="123",
+                user_name="Test User"
+            )
+        )
+    
+    # Mock stock levels
+    before_levels = {f"max_item_{i}": 100 for i in range(40)}
+    
+    # Test send_batch_approval_request
+    success = await telegram_service.send_batch_approval_request(
+        12345, "batch_max_test", movements, before_levels, "Test User"
+    )
+    
+    # Verify success and message was sent
+    assert success is True
+    assert len(telegram_service.bot.sent_messages) == 1
+    
+    # Verify message content
+    message = telegram_service.bot.sent_messages[0]
+    assert "<b>Items to process:</b> 40" in message["text"]
+    
+    # Verify all items are listed (no truncation)
+    assert "max_item_0" in message["text"]
+    assert "max_item_19" in message["text"]  # Middle item
+    assert "max_item_39" in message["text"]  # Last item (40th item, 0-indexed)
+    
+    # Verify no "more items" message since all items are shown
+    assert "... and" not in message["text"]
+    
+    # Verify the message length is reasonable (should be well under Telegram's 4096 limit)
+    assert len(message["text"]) < 4000  # Leave some buffer
 
 
 @pytest.mark.asyncio

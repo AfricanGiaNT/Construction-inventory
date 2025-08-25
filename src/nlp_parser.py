@@ -2,7 +2,14 @@
 
 import re
 from typing import Optional, Dict, Any, Tuple, List
-from datetime import datetime, UTC
+from datetime import datetime
+try:
+    from datetime import UTC
+except ImportError:
+    # UTC constant was introduced in Python 3.11
+    # For older versions, use timezone.utc
+    from datetime import timezone
+    UTC = timezone.utc
 
 # Use absolute imports for testing
 try:

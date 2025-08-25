@@ -105,18 +105,14 @@ class TelegramService:
                 f"<b>Items:</b>\n"
             )
             
-            # Add item summary, limited to 10 items for readability
-            for i, movement in enumerate(movements[:10], 1):
+            # Add item summary - show all items for complete verification
+            for i, movement in enumerate(movements, 1):
                 direction = "➕" if movement.movement_type == MovementType.IN else "➖"
                 if movement.movement_type == MovementType.ADJUST:
                     # For adjustments, show + or - based on the signed quantity
                     direction = "➕" if movement.signed_base_quantity >= 0 else "➖"
                     
                 text += f"{i}. {direction} <b>{movement.item_name}</b>: {abs(movement.quantity)} {movement.unit}\n"
-            
-            # If there are more than 10 items, show a count of remaining
-            if len(movements) > 10:
-                text += f"\n... and {len(movements) - 10} more items\n"
             
             text += f"\nPlease approve or reject this batch request."
             
