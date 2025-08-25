@@ -1,0 +1,1 @@
+        assert "Format: Newline" in call_args[1]

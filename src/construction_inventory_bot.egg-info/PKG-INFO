@@ -1,0 +1,264 @@
+Metadata-Version: 2.4
+Name: construction-inventory-bot
+Version: 0.1.0
+Summary: Telegram-first inventory tracking system for construction company
+Author: Trevor Chimtengo
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: python-telegram-bot>=20.7
+Requires-Dist: pyairtable>=2.2.0
+Requires-Dist: redis>=5.0.0
+Requires-Dist: apscheduler>=3.10.0
+Requires-Dist: pydantic>=2.5.0
+Requires-Dist: httpx>=0.25.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21.0; extra == "dev"
+Requires-Dist: pytest-mock>=3.12.0; extra == "dev"
+Requires-Dist: black>=23.0.0; extra == "dev"
+Requires-Dist: isort>=5.12.0; extra == "dev"
+Requires-Dist: flake8>=6.0.0; extra == "dev"
+
+# Construction Inventory Telegram Bot
+
+A Telegram-first inventory tracking system for construction companies, built as a background worker that integrates with Airtable for data storage.
+
+## Overview
+
+This bot provides a simple, command-based interface for managing construction inventory through Telegram group chats. All stock data is stored in Airtable, with the bot running as a background worker that polls for updates and executes scheduled tasks.
+
+## Features
+
+### Core Commands
+- **`/help`** - Show available commands based on user role
+- **`/whoami`** - Display user information and role
+- **`/find <query>`** - Search for items by SKU, name, or alias
+- **`/onhand <sku>`** - Check current stock level for an item
+- **`/in <sku> <qty> [unit] [location] [note]`** - Log stock in
+- **`/out <sku> <qty> [unit] [location] [note]`** - Log stock out (with approval workflow)
+- **`/adjust <sku> <±qty> [unit] [location] [note]`** - Admin-only stock adjustment
+- **`/approve <movement_id>`** - Admin approval for large movements
+- **`/audit`** - List low stock items
+- **`/export onhand`** - Export current inventory to CSV
+
+### Key Features
+- **Role-based access control** (Admin, Staff, Viewer)
+- **Approval workflow** for large stock movements
+- **Unit conversions** support
+- **Negative stock protection** (admin override available)
+- **Scheduled reports** (daily at 8:00 AM, weekly on Mondays at 9:00 AM)
+- **Automatic low stock alerts**
+
+## Architecture
+
+The system is designed as a background worker that:
+1. **Polls Telegram** for new messages using long polling
+2. **Processes commands** through a command parser and router
+3. **Integrates with Airtable** for data storage and retrieval
+4. **Runs scheduled tasks** using APScheduler
+5. **Handles role-based permissions** for all operations
+
+## Data Model
+
+### Airtable Tables
+- **Items** - Product catalog with SKU, name, base unit, thresholds
+- **Stock Movements** - Ledger of all inventory transactions
+- **Item Units** - Unit conversion factors
+- **Telegram Users** - User management and role assignments
+- **Locations** - Warehouse and site locations
+- **People** - Staff and contact information
+
+## Setup
+
+### Prerequisites
+- Python 3.9+
+- Telegram Bot Token
+- Airtable API Key and Base ID
+- Render account (for hosting)
+
+### Environment Variables
+
+Copy `config/env.example` to `config/.env` and configure:
+
+```bash
+# Telegram Configuration
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+TELEGRAM_ALLOWED_CHAT_IDS=123456789,-987654321
+
+# Airtable Configuration
+AIRTABLE_API_KEY=your_airtable_api_key_here
+AIRTABLE_BASE_ID=your_base_id_here
+
+# Application Settings
+APP_ENV=production
+LOG_LEVEL=INFO
+DEFAULT_APPROVAL_THRESHOLD=100
+WORKER_SLEEP_INTERVAL=10
+```
+
+### Local Development
+
+1. **Install dependencies:**
+   ```bash
+   pip install -e .
+   ```
+
+2. **Set up environment variables:**
+   ```bash
+   cp config/env.example config/.env
+   # Edit .env with your actual values
+   ```
+
+3. **Run the bot:**
+   ```bash
+   python -m src.main
+   ```
+
+### Deployment on Render
+
+1. **Connect your repository** to Render
+2. **Create a new Worker Service**
+3. **Use the provided `render.yaml`** for configuration
+4. **Set environment variables** in Render dashboard
+5. **Deploy**
+
+The bot will automatically start polling for Telegram updates and running scheduled tasks.
+
+## Usage
+
+### Getting Started
+1. Add the bot to your Telegram group
+2. Ensure the group chat ID is in `TELEGRAM_ALLOWED_CHAT_IDS`
+3. Use `/help` to see available commands
+4. Start with `/whoami` to check your role
+
+### Example Commands
+
+```bash
+# Check current stock
+/onhand ABC123
+
+# Log stock in
+/in ABC123 50 boxes warehouse received shipment
+
+# Log stock out
+/out ABC123 10 pieces site used for project
+
+# Search for items
+/find cement
+
+# Export inventory
+/export onhand
+```
+
+### Approval Workflow
+
+When a staff member requests a large stock movement:
+1. Movement is created with "Requested" status
+2. Admin receives approval request with inline buttons
+3. Admin can approve or void the movement
+4. Stock is updated only after approval
+
+## Configuration
+
+### Thresholds
+- **Approval Threshold**: Movements above this quantity require admin approval
+- **Rate Limiting**: Maximum commands per minute per user
+- **Polling Interval**: Seconds between Telegram update checks
+
+### Scheduling
+- **Daily Report**: 8:00 AM - Summary of previous day's activity
+- **Weekly Backup**: Monday 9:00 AM - Inventory status overview
+
+## Security
+
+- **Chat Allowlist**: Only specified Telegram chats can use the bot
+- **Role-based Access**: Commands restricted by user role
+- **Input Validation**: All commands and parameters are validated
+- **Audit Trail**: All stock movements are logged with user and timestamp
+
+## Monitoring
+
+The bot provides comprehensive logging:
+- Command execution logs
+- Error tracking
+- Scheduled task status
+- Airtable operation results
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Bot not responding**
+   - Check if the worker is running on Render
+   - Verify Telegram bot token is correct
+   - Ensure chat ID is in allowed list
+
+2. **Commands not working**
+   - Check user role in Airtable
+   - Verify command syntax
+   - Check logs for specific errors
+
+3. **Scheduled reports not sending**
+   - Verify timezone settings
+   - Check if scheduler is running
+   - Review chat ID configuration
+
+### Logs
+
+Check Render logs for:
+- Startup messages
+- Command processing
+- Scheduled task execution
+- Error details
+
+## Development
+
+### Project Structure
+```
+src/
+├── main.py              # Main bot class and entry point
+├── config.py            # Configuration and environment variables
+├── schemas.py           # Pydantic models
+├── airtable_client.py   # Airtable integration
+├── auth.py              # Authentication and authorization
+├── commands.py          # Command parsing and routing
+├── telegram.py          # Telegram bot operations
+└── services/
+    ├── stock.py         # Stock management logic
+    ├── approvals.py     # Approval workflow
+    └── queries.py       # Reporting and queries
+```
+
+### Adding New Commands
+
+1. **Update command patterns** in `commands.py`
+2. **Add command logic** in `main.py` execute_command method
+3. **Update permissions** in `auth.py`
+4. **Add help text** in `telegram.py`
+
+### Testing
+
+```bash
+# Install dev dependencies
+pip install -e ".[dev]"
+
+# Run tests
+pytest
+
+# Format code
+black src/
+isort src/
+```
+
+## License
+
+This project is for personal use and internal company operations.
+
+## Support
+
+For issues or questions:
+1. Check the logs for error details
+2. Verify configuration settings
+3. Review Airtable table structure
+4. Ensure proper user roles are set

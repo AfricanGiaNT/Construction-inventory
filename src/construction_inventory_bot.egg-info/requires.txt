@@ -1,0 +1,14 @@
+python-telegram-bot>=20.7
+pyairtable>=2.2.0
+redis>=5.0.0
+apscheduler>=3.10.0
+pydantic>=2.5.0
+httpx>=0.25.0
+
+[dev]
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-mock>=3.12.0
+black>=23.0.0
+isort>=5.12.0
+flake8>=6.0.0

@@ -1,0 +1,38 @@
+services:
+  - type: worker
+    name: construction-inventory-bot
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.18
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ALLOWED_CHAT_IDS
+        sync: false
+      - key: AIRTABLE_API_KEY
+        sync: false
+      - key: AIRTABLE_BASE_ID
+        sync: false
+      - key: REDIS_URL
+        value: redis://localhost:6379
+      - key: REDIS_ENABLED
+        value: false
+      - key: APP_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DEFAULT_APPROVAL_THRESHOLD
+        value: 100
+      - key: RATE_LIMIT_PER_MINUTE
+        value: 30
+      - key: DAILY_REPORT_TIME
+        value: 08:00
+      - key: WEEKLY_BACKUP_DAY
+        value: 0
+      - key: WEEKLY_BACKUP_TIME
+        value: 09:00
+      - key: WORKER_SLEEP_INTERVAL
+        value: 10
+

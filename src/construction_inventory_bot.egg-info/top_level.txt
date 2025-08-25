@@ -1,0 +1,9 @@
+airtable_client
+auth
+commands
+config
+main
+nlp_parser
+schemas
+services
+telegram
