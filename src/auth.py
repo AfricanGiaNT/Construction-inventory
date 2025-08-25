@@ -28,6 +28,11 @@ class AuthService:
     
     def is_chat_allowed(self, chat_id: int) -> bool:
         """Check if a chat ID is in the allowed list."""
+        # If no specific chat IDs are specified, allow access from any chat
+        if not self.settings.telegram_allowed_chat_ids:
+            return True
+        
+        # Otherwise, check if the chat ID is in the allowed list
         return chat_id in self.settings.telegram_allowed_chat_ids
     
     def can_execute_command(self, command: str, user_role: UserRole) -> bool:

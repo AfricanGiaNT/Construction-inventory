@@ -52,11 +52,11 @@ Add these environment variables in Render (mark sensitive ones as "Secret"):
 
 **Required (Mark as Secret):**
 - `TELEGRAM_BOT_TOKEN` - Your bot token from @BotFather
-- `TELEGRAM_ALLOWED_CHAT_IDS` - Comma-separated chat IDs
 - `AIRTABLE_API_KEY` - Your Airtable API key
 - `AIRTABLE_BASE_ID` - Your Airtable base ID
 
-**Optional (Default values):**
+**Optional:**
+- `TELEGRAM_ALLOWED_CHAT_IDS` - Comma-separated chat IDs (if not set, bot works in any chat)
 - `REDIS_URL` - `redis://localhost:6379`
 - `REDIS_ENABLED` - `false`
 - `APP_ENV` - `production`

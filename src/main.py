@@ -1198,12 +1198,14 @@ class ConstructionInventoryBot:
             report = await self.query_service.generate_daily_report()
             report_data = report.dict()
             
-            # Send to all allowed chats
-            for chat_id in self.settings.telegram_allowed_chat_ids:
-                await self.telegram_service.send_daily_report(chat_id, report_data)
+            # Send to all allowed chats if specified, otherwise log that no specific chats are configured
+            if self.settings.telegram_allowed_chat_ids:
+                for chat_id in self.settings.telegram_allowed_chat_ids:
+                    await self.telegram_service.send_daily_report(chat_id, report_data)
+                logger.info("Daily report sent successfully to configured chats")
+            else:
+                logger.info("No specific chat IDs configured for daily reports - bot will respond to commands in any chat")
                 
-            logger.info("Daily report sent successfully")
-            
         except Exception as e:
             logger.error(f"Error sending daily report: {e}")
     
@@ -1215,18 +1217,20 @@ class ConstructionInventoryBot:
             # Generate inventory summary
             summary = await self.query_service.get_inventory_summary()
             
-            # Send to all allowed chats
-            for chat_id in self.settings.telegram_allowed_chat_ids:
-                await self.telegram_service.send_message(
-                    chat_id,
-                    f"📊 <b>Weekly Inventory Summary</b>\n\n"
-                    f"<b>Low Stock Items:</b> {summary['low_stock_count']}\n"
-                    f"<b>Pending Approvals:</b> {summary['pending_approvals']}\n"
-                    f"<b>Last Updated:</b> {summary['last_updated']}"
-                )
+            # Send to all allowed chats if specified, otherwise log that no specific chats are configured
+            if self.settings.telegram_allowed_chat_ids:
+                for chat_id in self.settings.telegram_allowed_chat_ids:
+                    await self.telegram_service.send_message(
+                        chat_id,
+                        f"📊 <b>Weekly Inventory Summary</b>\n\n"
+                        f"<b>Low Stock Items:</b> {summary['low_stock_count']}\n"
+                        f"<b>Pending Approvals:</b> {summary['pending_approvals']}\n"
+                        f"<b>Last Updated:</b> {summary['last_updated']}"
+                    )
+                logger.info("Weekly backup sent successfully to configured chats")
+            else:
+                logger.info("No specific chat IDs configured for weekly backups - bot will respond to commands in any chat")
                 
-            logger.info("Weekly backup sent successfully")
-            
         except Exception as e:
             logger.error(f"Error sending weekly backup: {e}")
 

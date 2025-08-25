@@ -9,8 +9,6 @@ services:
         value: 3.11.0
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: TELEGRAM_ALLOWED_CHAT_IDS
-        sync: false
       - key: AIRTABLE_API_KEY
         sync: false
       - key: AIRTABLE_BASE_ID

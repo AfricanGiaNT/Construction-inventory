@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     
     # Telegram Configuration
     telegram_bot_token: str
-    telegram_allowed_chat_ids: str
+    telegram_allowed_chat_ids: Optional[str] = None  # Made optional
     
     # Airtable Configuration
     airtable_api_key: str
@@ -49,8 +49,10 @@ class Settings(BaseSettings):
     worker_sleep_interval: int = 10  # seconds between polling cycles
     
     @validator("telegram_allowed_chat_ids")
-    def parse_chat_ids(cls, v: str) -> List[int]:
+    def parse_chat_ids(cls, v: Optional[str]) -> List[int]:
         """Parse comma-separated chat IDs into a list of integers."""
+        if not v:
+            return []  # Return empty list if no chat IDs specified
         try:
             return [int(chat_id.strip()) for chat_id in v.split(",") if chat_id.strip()]
         except ValueError:

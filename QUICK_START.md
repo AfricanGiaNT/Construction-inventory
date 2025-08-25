@@ -9,9 +9,9 @@ cp config/env.example config/.env
 
 # Edit config/.env with your actual values:
 # - TELEGRAM_BOT_TOKEN (from @BotFather)
-# - TELEGRAM_ALLOWED_CHAT_IDS (your chat IDs)
 # - AIRTABLE_API_KEY (from Airtable)
 # - AIRTABLE_BASE_ID (from Airtable)
+# - TELEGRAM_ALLOWED_CHAT_IDS (optional - if not set, bot works in any chat)
 ```
 
 ### 2. Run Deployment Script
