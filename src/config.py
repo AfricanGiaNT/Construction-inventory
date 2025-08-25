@@ -6,7 +6,13 @@ from typing import List, Optional
 try:
     from pydantic_settings import BaseSettings
 except ImportError:
-    from pydantic import BaseSettings
+    try:
+        from pydantic import BaseSettings
+    except ImportError:
+        raise ImportError(
+            "Neither pydantic_settings nor pydantic.BaseSettings found. "
+            "Please install pydantic-settings: pip install pydantic-settings"
+        )
 
 from pydantic import validator
 
