@@ -12,23 +12,16 @@ class CommandParser:
     
     def __init__(self):
         """Initialize the command parser."""
-        # Command patterns
-        self.patterns = {
-            "help": r"^/help$",
+        # Command patterns - order matters! More specific patterns must come first
+        self.command_patterns = {
+            "help": r"^/help\s*(.+)?$",  # Optional help topic
+            "status": r"^/status\s*(.+)?$",  # Optional status topic
             "whoami": r"^/whoami$",
-            "find": r"^/find\s+(.+)$",
-            "onhand": r"^/onhand\s+(\S+)$",
             "in": r"^/in\s+([\s\S]+)$",  # Captures everything after /in including newlines
             "out": r"^/out\s+([\s\S]+)$",  # Captures everything after /out including newlines
-            "adjust": r"^/adjust\s+([\s\S]+)$",  # Captures everything after /adjust including newlines
-            "approve": r"^/approve\s+(\S+)$",
-            "audit": r"^/audit$",
-            "setthreshold": r"^/setthreshold\s+([\d.]+)$",
-            "export": r"^/export\s+(onhand)$",
-            "batchhelp": r"^/batchhelp$",
-            "status": r"^/status$",
-            "validate": r"^/validate\s+([\s\S]+)$",  # Captures everything after /validate including newlines
-            "stock": r"^/stock\s+(.+)$"  # Captures everything after /stock for fuzzy search
+            "stock": r"^/stock\s+(.+)$",  # Captures everything after /stock for fuzzy search
+            "inventory_validate": r"^/inventory\s+validate\s+([\s\S]+)$",  # Must come before inventory
+            "inventory": r"^/inventory\s+([\s\S]+)$"  # Captures everything after /inventory including newlines
         }
         
         # Initialize NLP parser
@@ -43,14 +36,12 @@ class CommandParser:
         text = text.strip()
         logger.info(f"DEBUG - Parsing command: '{text}'")
         
-        for command, pattern in self.patterns.items():
+        for command, pattern in self.command_patterns.items():
             match = re.match(pattern, text, re.IGNORECASE)
             if match:
                 args = list(match.groups())
                 # Remove None values from args
                 args = [arg for arg in args if arg is not None]
-                
-                logger.info(f"DEBUG - Command matched: '{command}' with args: {args}")
                 
                 return Command(
                     command=command,

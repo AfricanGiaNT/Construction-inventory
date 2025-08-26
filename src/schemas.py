@@ -65,6 +65,9 @@ class Item(BaseModel):
     location: Optional[str] = None  # Preferred Location field
     category: Optional[str] = None  # Category field
     large_qty_threshold: Optional[float] = None  # Large Qty Threshold field
+    is_active: Optional[bool] = True  # Is Active field
+    last_stocktake_date: Optional[str] = None  # Last Stocktake Date field
+    last_stocktake_by: Optional[str] = None  # Last Stocktake By field
 
 
 class StockMovement(BaseModel):
@@ -191,3 +194,19 @@ class Response(BaseModel):
     success: bool
     message: str
     data: Optional[dict] = None
+
+
+class StocktakeAuditRecord(BaseModel):
+    """Audit record for a single inventory item change."""
+    batch_id: str
+    date: str  # ISO date string
+    logged_by: str  # Comma-separated names
+    item_name: str
+    counted_qty: float
+    previous_on_hand: float
+    new_on_hand: float
+    applied_at: datetime
+    applied_by: str
+    item: Optional[str] = None  # Item record link
+    notes: Optional[str] = None  # Notes field
+    discrepancy: Optional[float] = None  # Discrepancy field

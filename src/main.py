@@ -21,8 +21,13 @@ from .services.queries import QueryService
 from .services.stock_query import StockQueryService
 from .services.keyboard_management import KeyboardManagementService
 from .services.command_suggestions import CommandSuggestionsService
+from .services.inventory import InventoryService
+from .services.idempotency import IdempotencyService
+from .services.persistent_idempotency import PersistentIdempotencyService
+from .services.audit_trail import AuditTrailService
 from .telegram_service import TelegramService
 from .health import init_health_checker
+from .schemas import UserRole
 
 # Configure basic logging
 logging.basicConfig(
@@ -69,6 +74,15 @@ class ConstructionInventoryBot:
         self.stock_query_service = StockQueryService(self.airtable_client)
         self.keyboard_management_service = KeyboardManagementService(expiry_hours=1, max_clicks_per_minute=10)
         self.command_suggestions_service = CommandSuggestionsService()
+        self.idempotency_service = IdempotencyService()
+        self.persistent_idempotency_service = PersistentIdempotencyService(self.airtable_client)
+        self.audit_trail_service = AuditTrailService(self.airtable_client)
+        self.inventory_service = InventoryService(
+            self.airtable_client, 
+            self.settings,
+            audit_trail_service=self.audit_trail_service,
+            persistent_idempotency_service=self.persistent_idempotency_service
+        )
         self.telegram_service = TelegramService(self.settings)
         
         # Initialize scheduler
@@ -387,33 +401,39 @@ class ConstructionInventoryBot:
                 self.monitoring_stats['commands_processed'] += 1
                 logger.info(f"Processing command: {text} from user {user_name} ({user_id}) in chat {chat_id}")
                 
+                # Fix escaped newlines in Telegram messages
+                if '\\n' in text:
+                    text = text.replace('\\n', '\n')
+                
                 # Create user if they don't exist FIRST (before permission check)
                 logger.info(f"Attempting to create user {user_id} ({user_name}) if they don't exist...")
                 user_created = await self.airtable_client.create_user_if_not_exists(user_id, username, user_name, chat_id=chat_id)
                 logger.info(f"User creation result: {user_created}")
                 
                 # Now validate user access (after user creation)
+                # Use command parser to get the correct command name for permission checking
+                temp_command = await self.command_router.route_command(
+                    text, chat_id, user_id, user_name, message_id, update_id
+                )
+                
+                if temp_command[1]:  # If there's an error
+                    await self.telegram_service.send_error_message(chat_id, temp_command[1])
+                    return
+                
+                if not temp_command[0]:  # If no command returned
+                    return
+                
+                command_name = temp_command[0].command
                 access_valid, access_message, user_role = await self.auth_service.validate_user_access(
-                    user_id, chat_id, text.split()[0][1:]  # Remove leading slash
+                    user_id, chat_id, command_name
                 )
                 
                 if not access_valid:
                     await self.telegram_service.send_error_message(chat_id, access_message)
                     return
                 
-                # Debug log for command text
-                logger.info(f"DEBUG - Command text before routing: '{text}'")
-                
-                # Route and execute command
-                command, error = await self.command_router.route_command(
-                    text, chat_id, user_id, user_name, message_id, update_id
-                )
-                
-                if error:
-                    await self.telegram_service.send_error_message(chat_id, error)
-                    return
-                
-                # Execute command
+                # Execute command (already parsed during permission check)
+                command = temp_command[0]
                 await self.execute_command(command, chat_id, user_id, user_name, user_role)
                 
             else:
@@ -527,6 +547,95 @@ class ConstructionInventoryBot:
                 logger.info(f"Processing stock query: '{query}' for user {user_name}")
                 
                 await self.handle_stock_command(chat_id, user_id, user_name, query)
+                
+            elif cmd == "inventory_validate":
+                # Admin-only command
+                if user_role != UserRole.ADMIN:
+                    await self.telegram_service.send_error_message(
+                        chat_id,
+                        "❌ <b>Access Denied</b>\n\n"
+                        "The /inventory validate command is restricted to administrators only."
+                    )
+                    return
+
+                if not args:
+                    await self.telegram_service.send_message(
+                        chat_id,
+                        "🔍 <b>Inventory Validation</b>\n\n"
+                        "This command allows administrators to validate inventory commands without applying them.\n\n"
+                        "<b>Usage:</b>\n"
+                        "/inventory validate date:DD/MM/YY logged by: NAME1,NAME2\n"
+                        "Item Name, Quantity\n"
+                        "Item Name, Quantity\n\n"
+                        "<b>Examples:</b>\n"
+                        "/inventory validate date:25/08/25 logged by: Trevor,Kayesera\n"
+                        "Cement 32.5, 50\n"
+                        "12mm rebar, 120.0\n"
+                        "Safety helmets, 25\n\n"
+                        "<b>Notes:</b>\n"
+                        "• Validates format without making changes\n"
+                        "• Maximum 50 entries per batch\n"
+                        "• Shows normalized dates and parsed entries\n"
+                        "• Use to test before applying"
+                    )
+                    return
+
+                # Process the inventory validation command
+                full_text = args[0] if len(args) == 1 else " ".join(args)
+                await self.handle_inventory_validate_command(chat_id, user_id, user_name, full_text)
+
+            elif cmd == "inventory":
+                # Admin-only command
+                if user_role != UserRole.ADMIN:
+                    await self.telegram_service.send_error_message(
+                        chat_id,
+                        "❌ <b>Access Denied</b>\n\n"
+                        "The /inventory command is restricted to administrators only."
+                    )
+                    return
+
+                if not args:
+                    await self.telegram_service.send_message(
+                        chat_id,
+                        "📊 <b>Inventory Stocktake</b>\n\n"
+                        "This command allows administrators to perform inventory stocktaking.\n\n"
+                        "<b>Usage:</b>\n"
+                        "/inventory date:DD/MM/YY logged by: NAME1,NAME2\n"
+                        "Item Name, Quantity\n"
+                        "Item Name, Quantity\n\n"
+                        "<b>Examples:</b>\n"
+                        "/inventory date:25/08/25 logged by: Trevor,Kayesera\n"
+                        "Cement 32.5, 50\n"
+                        "12mm rebar, 120.0\n"
+                        "Safety helmets, 25\n\n"
+                        "<b>Notes:</b>\n"
+                        "• Maximum 50 entries per batch\n"
+                        "• Duplicate items use last occurrence\n"
+                        "• New items are created with default settings\n"
+                        "• Existing items are updated to counted quantity\n"
+                        "• Use /inventory validate to test first"
+                    )
+                    return
+
+                # Process the inventory command
+                # For multi-line commands, we need to preserve the newlines
+                full_text = args[0] if len(args) == 1 else " ".join(args)
+
+                # Check for idempotency (prevent duplicate applies) - now persistent across restarts
+                if await self.persistent_idempotency_service.is_duplicate(full_text):
+                    await self.telegram_service.send_error_message(
+                        chat_id,
+                        "⚠️ <b>Duplicate Request Detected</b>\n\n"
+                        "This exact inventory command was already processed recently.\n\n"
+                        "If you need to apply the same inventory again, please wait for the idempotency period to expire "
+                        "or modify the command slightly (e.g., add a comment or change spacing).\n\n"
+                        "💡 <b>Note:</b> This check persists across bot restarts."
+                    )
+                    return
+
+                logger.info(f"Processing inventory command for user {user_name}")
+
+                await self.handle_inventory_command(chat_id, user_id, user_name, full_text)
                 
             elif cmd == "whoami":
                 await self.telegram_service.send_message(
@@ -1383,6 +1492,56 @@ class ConstructionInventoryBot:
             error_text = (
                 "❌ <b>Stock Confirmation Error</b>\n\n"
                 f"An error occurred while processing your confirmation: {str(e)}\n\n"
+                "Please try again or contact support if the problem persists."
+            )
+            await self.telegram_service.send_message(chat_id, error_text)
+
+    async def handle_inventory_validate_command(self, chat_id: int, user_id: int, user_name: str, command_text: str):
+        """Handle /inventory validate command for validation only."""
+        try:
+            logger.info(f"Processing inventory validation: '{command_text}' for user {user_name}")
+
+            # Process the inventory command in validate-only mode
+            success, message = await self.inventory_service.process_inventory_stocktake(
+                command_text, user_id, user_name, validate_only=True
+            )
+
+            if success:
+                await self.telegram_service.send_message(chat_id, message)
+            else:
+                await self.telegram_service.send_error_message(chat_id, message)
+
+        except Exception as e:
+            logger.error(f"Error handling inventory validation: {e}")
+            error_text = (
+                "❌ <b>Inventory Validation Error</b>\n\n"
+                f"An error occurred while validating your inventory command: {str(e)}\n\n"
+                "Please try again or contact support if the problem persists."
+            )
+            await self.telegram_service.send_message(chat_id, error_text)
+
+    async def handle_inventory_command(self, chat_id: int, user_id: int, user_name: str, command_text: str):
+        """Handle /inventory command for stocktaking."""
+        try:
+            logger.info(f"Processing inventory command: '{command_text}' for user {user_name}")
+            
+            # Process the inventory command using the inventory service
+            success, message = await self.inventory_service.process_inventory_stocktake(
+                command_text, user_id, user_name
+            )
+            
+            if success:
+                # Store persistent idempotency key to prevent duplicates across restarts
+                await self.persistent_idempotency_service.store_key(command_text)
+                await self.telegram_service.send_message(chat_id, message)
+            else:
+                await self.telegram_service.send_error_message(chat_id, message)
+                
+        except Exception as e:
+            logger.error(f"Error handling inventory command: {e}")
+            error_text = (
+                "❌ <b>Inventory Command Error</b>\n\n"
+                f"An error occurred while processing your inventory command: {str(e)}\n\n"
                 "Please try again or contact support if the problem persists."
             )
             await self.telegram_service.send_message(chat_id, error_text)

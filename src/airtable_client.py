@@ -28,6 +28,8 @@ class AirtableClient:
         self.units_table = self.base.table("Item Units")
         self.locations_table = self.base.table("Locations")
         self.people_table = self.base.table("People")
+        self.bot_meta_table = self.base.table("Bot Meta")
+        self.stocktakes_table = self.base.table("Stocktakes")
     
     async def get_item(self, item_name: str) -> Optional[Item]:
         """Get an item by name."""
@@ -49,7 +51,10 @@ class AirtableClient:
                 threshold=record["fields"].get("Reorder Level"),  # Using Reorder Level as threshold
                 location=record["fields"].get("Preferred Location", [None])[0] if record["fields"].get("Preferred Location") else None,
                 category=record["fields"].get("Category", ""),
-                large_qty_threshold=record["fields"].get("Large Qty Threshold")
+                large_qty_threshold=record["fields"].get("Large Qty Threshold"),
+                is_active=record["fields"].get("Is Active", True),
+                last_stocktake_date=record["fields"].get("Last Stocktake Date"),
+                last_stocktake_by=record["fields"].get("Last Stocktake By")
             )
         except Exception as e:
             logger.error(f"Error getting item {item_name}: {e}")
@@ -677,3 +682,143 @@ class AirtableClient:
         except Exception as e:
             logger.error(f"Error getting last updated time for item '{item_name}': {e}")
             return None
+
+    # Bot Meta table methods for idempotency
+    async def store_idempotency_key(self, key: str) -> bool:
+        """Store an idempotency key in the Bot Meta table."""
+        try:
+            record = {
+                "Key": key,
+                "Created At": datetime.now().isoformat()
+            }
+            created = self.bot_meta_table.create(record)
+            return bool(created.get("id"))
+        except Exception as e:
+            logger.error(f"Error storing idempotency key: {e}")
+            return False
+
+    async def check_idempotency_key(self, key: str) -> bool:
+        """Check if an idempotency key exists in the Bot Meta table."""
+        try:
+            formula = match({"Key": key})
+            records = self.bot_meta_table.all(formula=formula, max_records=1)
+            return len(records) > 0
+        except Exception as e:
+            logger.error(f"Error checking idempotency key: {e}")
+            return False
+
+    # Stocktakes table methods for audit trail
+    async def create_stocktake_record(self, 
+                                    batch_id: str,
+                                    date: str,
+                                    logged_by: str,
+                                    item_name: str,
+                                    counted_qty: float,
+                                    previous_on_hand: float,
+                                    new_on_hand: float,
+                                    applied_at: datetime,
+                                    applied_by: str,
+                                    notes: Optional[str] = None,
+                                    discrepancy: Optional[float] = None) -> Optional[str]:
+        """Create a stocktake record in the Stocktakes table."""
+        try:
+            # Get the item record ID for linking
+            item = await self.get_item(item_name)
+            item_record_id = None
+            if item:
+                # We need to get the actual record ID from Airtable
+                formula = match({"Name": item_name})
+                records = self.items_table.all(formula=formula, max_records=1)
+                if records:
+                    item_record_id = records[0]["id"]
+
+            record = {
+                "Batch Id": batch_id,
+                "Date": date,
+                "Logged By": logged_by,
+                "Item Name": item_name,
+                "Counted Qty": counted_qty,
+                "Previous On Hand": previous_on_hand,
+                "New On Hand": new_on_hand,
+                "Applied At": applied_at.strftime("%Y-%m-%d"),
+                "Applied By": applied_by
+            }
+
+            # Add optional fields if provided
+            if item_record_id:
+                record["Item"] = [item_record_id]
+            if notes:
+                record["Notes"] = notes
+            if discrepancy is not None:
+                record["Discrepancy"] = discrepancy
+
+            created = self.stocktakes_table.create(record)
+            return created.get("id")
+        except Exception as e:
+            logger.error(f"Error creating stocktake record: {e}")
+            return None
+
+    async def get_stocktake_records_by_batch(self, batch_id: str) -> List[dict]:
+        """Get all stocktake records for a specific batch."""
+        try:
+            formula = match({"Batch Id": batch_id})
+            records = self.stocktakes_table.all(formula=formula)
+            return records
+        except Exception as e:
+            logger.error(f"Error getting stocktake records for batch {batch_id}: {e}")
+            return []
+
+    async def get_stocktake_records_by_item(self, item_name: str, limit: int = 100) -> List[dict]:
+        """Get recent stocktake records for a specific item."""
+        try:
+            formula = match({"Item Name": item_name})
+            records = self.stocktakes_table.all(formula=formula, max_records=limit)
+            return records
+        except Exception as e:
+            logger.error(f"Error getting stocktake records for item {item_name}: {e}")
+            return []
+
+    async def get_stocktake_records_by_date_range(self, start_date: str, end_date: str, limit: int = 100) -> List[dict]:
+        """Get stocktake records within a date range."""
+        try:
+            # Airtable date filtering - we'll get all records and filter by date
+            # This could be optimized with a formula if needed
+            all_records = self.stocktakes_table.all(max_records=limit)
+            filtered_records = []
+            
+            for record in all_records:
+                record_date = record["fields"].get("Date")
+                if record_date and start_date <= record_date <= end_date:
+                    filtered_records.append(record)
+                    
+            return filtered_records
+        except Exception as e:
+            logger.error(f"Error getting stocktake records for date range {start_date} to {end_date}: {e}")
+            return []
+
+    async def update_item_provenance(self, item_name: str, stocktake_date: str, stocktake_by: str) -> bool:
+        """Update the Last Stocktake Date and Last Stocktake By fields for an item."""
+        try:
+            # Find the item record
+            formula = match({"Name": item_name})
+            records = self.items_table.all(formula=formula, max_records=1)
+            
+            if not records:
+                logger.warning(f"Item '{item_name}' not found for provenance update")
+                return False
+            
+            record_id = records[0]["id"]
+            
+            # Update the provenance fields
+            update_data = {
+                "Last Stocktake Date": stocktake_date,
+                "Last Stocktake By": stocktake_by
+            }
+            
+            self.items_table.update(record_id, update_data)
+            logger.info(f"Updated provenance fields for item '{item_name}'")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating provenance fields for item '{item_name}': {e}")
+            return False

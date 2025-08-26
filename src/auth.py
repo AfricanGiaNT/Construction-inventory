@@ -54,7 +54,9 @@ class AuthService:
             "approve": [UserRole.ADMIN],  # Only admins can approve
             "audit": [UserRole.ADMIN, UserRole.STAFF],
             "setthreshold": [UserRole.ADMIN],
-            "export": [UserRole.ADMIN, UserRole.STAFF]
+            "export": [UserRole.ADMIN, UserRole.STAFF],
+            "inventory": [UserRole.ADMIN],  # Only admins can perform inventory stocktake
+            "inventory_validate": [UserRole.ADMIN]  # Only admins can validate inventory commands
         }
         
         allowed_roles = permissions.get(command, [])

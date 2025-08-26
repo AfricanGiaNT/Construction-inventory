@@ -73,6 +73,18 @@ class CommandSuggestionsService:
                 "usage": "/audit",
                 "examples": ["/audit"]
             },
+            "inventory_validate": {
+                "category": "Management",
+                "description": "Validate inventory stocktake without applying (admin only)",
+                "usage": "/inventory validate date:DD/MM/YY logged by: NAME1,NAME2",
+                "examples": ["/inventory validate date:25/08/25 logged by: Trevor,Kayesera"]
+            },
+            "inventory": {
+                "category": "Management",
+                "description": "Perform inventory stocktake (admin only)",
+                "usage": "/inventory date:DD/MM/YY logged by: NAME1,NAME2",
+                "examples": ["/inventory date:25/08/25 logged by: Trevor,Kayesera"]
+            },
             "export": {
                 "category": "Management",
                 "description": "Export inventory data",
