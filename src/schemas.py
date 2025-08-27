@@ -68,6 +68,15 @@ class Item(BaseModel):
     is_active: Optional[bool] = True  # Is Active field
     last_stocktake_date: Optional[str] = None  # Last Stocktake Date field
     last_stocktake_by: Optional[str] = None  # Last Stocktake By field
+    
+    # New fields for enhanced item structure (mixed-size materials)
+    unit_size: float = Field(default=1.0, gt=0, description="Size of each individual unit (e.g., 20 for 20ltr can)")
+    unit_type: str = Field(default="piece", min_length=1, description="Unit type for unit size (e.g., ltrs, kg, m)")
+    
+    @property
+    def total_volume(self) -> float:
+        """Calculate total volume as unit_size × on_hand quantity."""
+        return self.unit_size * self.on_hand
 
 
 class StockMovement(BaseModel):

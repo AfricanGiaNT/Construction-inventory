@@ -54,7 +54,10 @@ class AirtableClient:
                 large_qty_threshold=record["fields"].get("Large Qty Threshold"),
                 is_active=record["fields"].get("Is Active", True),
                 last_stocktake_date=record["fields"].get("Last Stocktake Date"),
-                last_stocktake_by=record["fields"].get("Last Stocktake By")
+                last_stocktake_by=record["fields"].get("Last Stocktake By"),
+                # New fields for enhanced item structure
+                unit_size=record["fields"].get("Unit Size", 1.0),
+                unit_type=record["fields"].get("Unit Type", "piece")
             )
         except Exception as e:
             logger.error(f"Error getting item {item_name}: {e}")
@@ -83,7 +86,10 @@ class AirtableClient:
                         threshold=fields.get("Reorder Level"),
                         location=fields.get("Preferred Location", [None])[0] if fields.get("Preferred Location") else None,
                         category=fields.get("Category", ""),
-                        large_qty_threshold=fields.get("Large Qty Threshold")
+                        large_qty_threshold=fields.get("Large Qty Threshold"),
+                        # New fields for enhanced item structure
+                        unit_size=fields.get("Unit Size", 1.0),
+                        unit_type=fields.get("Unit Type", "piece")
                     ))
             
             return results[:10]  # Limit results
@@ -109,7 +115,10 @@ class AirtableClient:
                     threshold=fields.get("Reorder Level"),
                     location=fields.get("Preferred Location", [None])[0] if fields.get("Preferred Location") else None,
                     category=fields.get("Category", ""),
-                    large_qty_threshold=fields.get("Large Qty Threshold")
+                    large_qty_threshold=fields.get("Large Qty Threshold"),
+                    # New fields for enhanced item structure
+                    unit_size=fields.get("Unit Size", 1.0),
+                    unit_type=fields.get("Unit Type", "piece")
                 )
                 items.append(item)
             
@@ -178,7 +187,10 @@ class AirtableClient:
                 "On Hand": 0.0,
                 "Reorder Level": 10,  # Default threshold
                 "Large Qty Threshold": 100,  # Default approval threshold
-                "Is Active": True
+                "Is Active": True,
+                # New fields for enhanced item structure
+                "Unit Size": 1.0,  # Default unit size
+                "Unit Type": "piece"  # Default unit type
             }
             
             logger.info(f"Creating new item: {item_name} with unit: {valid_unit}")
