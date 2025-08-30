@@ -6,13 +6,13 @@ import uuid
 from datetime import datetime, UTC
 from typing import List, Optional, Tuple, Dict, Any
 
-from ..schemas import (
+from schemas import (
     StockMovement, BatchResult, BatchError, BatchErrorType, 
     MovementType, UserRole, BatchApproval, MovementStatus
 )
-from ..airtable_client import AirtableClient
-from .stock import StockService
-from ..utils.error_handling import ErrorHandler
+from airtable_client import AirtableClient
+from services.stock import StockService
+from utils.error_handling import ErrorHandler
 
 logger = logging.getLogger(__name__)
 
@@ -37,38 +37,65 @@ class BatchStockService:
         """Get the pending batch approvals dictionary."""
         return self._pending_approvals
     
+    async def _populate_movement_unit_info(self, movements: List[StockMovement]) -> None:
+        """
+        Populate unit_size and unit_type fields for movements based on item details.
+        
+        Args:
+            movements: List of movements to populate unit info for
+        """
+        try:
+            for movement in movements:
+                if not movement.unit_size or not movement.unit_type:
+                    # Get item details to populate unit info
+                    item = await self.airtable.get_item(movement.item_name)
+                    if item:
+                        movement.unit_size = item.unit_size
+                        movement.unit_type = item.unit_type
+                        logger.debug(f"Populated unit info for {movement.item_name}: size={item.unit_size}, type={item.unit_type}")
+        except Exception as e:
+            logger.warning(f"Error populating unit info for movements: {e}")
+
     async def prepare_batch_approval(
         self, movements: List[StockMovement], user_role: UserRole, 
         chat_id: int, user_id: int, user_name: str, 
         global_parameters: Dict[str, str] = None
     ) -> Tuple[bool, str, Optional[BatchApproval]]:
         """
-        Prepare a batch for approval without processing it.
+        Prepare a batch of stock movements for approval.
         
         Args:
-            movements: List of stock movements to be processed
-            user_role: Role of the user submitting the batch
-            chat_id: Telegram chat ID where the request originated
-            user_id: User ID of the requester
-            user_name: Name of the requester
-            global_parameters: Dictionary of global parameters for the batch
+            movements: List of movements to process
+            user_role: Role of the user requesting the batch
+            chat_id: Telegram chat ID
+            user_id: Telegram user ID
+            user_name: Name of the user
+            global_parameters: Optional global parameters to apply to all movements
             
         Returns:
-            Tuple containing:
-            - Success flag (bool)
-            - Message or batch_id (str)
-            - BatchApproval object if successful, None if failed
+            Tuple of (success, message, batch_approval)
         """
         try:
-            # Create a unique batch ID
-            batch_id = f"batch_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+            # Generate unique batch ID
+            batch_id = str(uuid.uuid4())
             
-            logger.info(f"Preparing batch approval with ID {batch_id} for {len(movements)} movements")
-            
-            # Mark all movements as pending approval and set batch_id
-            for movement in movements:
-                movement.status = MovementStatus.PENDING_APPROVAL
-                movement.batch_id = batch_id
+            # Apply global parameters if provided
+            if global_parameters:
+                for movement in movements:
+                    # Apply global parameters to each movement
+                    if 'driver' in global_parameters and not movement.driver_name:
+                        movement.driver_name = global_parameters['driver']
+                    if 'from' in global_parameters and not movement.from_location:
+                        movement.from_location = global_parameters['from']
+                    if 'to' in global_parameters and not movement.to_location:
+                        movement.to_location = global_parameters['to']
+                    if 'project' in global_parameters and not movement.project:
+                        movement.project = global_parameters['project']
+                    if 'location' in global_parameters and not movement.location:
+                        movement.location = global_parameters['location']
+                    
+                    # Set batch ID for tracking
+                    movement.batch_id = batch_id
             
             # Collect current stock levels for before/after comparison
             before_levels = {}
@@ -79,6 +106,9 @@ class BatchStockService:
                         before_levels[movement.item_name] = item.on_hand
                     else:
                         before_levels[movement.item_name] = 0
+            
+            # Populate unit info for enhanced display
+            await self._populate_movement_unit_info(movements)
             
             # Create batch approval object
             batch_approval = BatchApproval(
@@ -154,8 +184,8 @@ class BatchStockService:
                     )
                     
                     if success:
-                        movement_id = movement.id if movement.id else f"movement_{i}"
-                        successful_movements.append(movement_id)
+                        # Store the movement object for summary generation
+                        successful_movements.append(movement)
                         logger.debug(f"Successfully processed movement {i+1}: {movement.item_name}")
                     else:
                         # Record the failure using ErrorHandler
@@ -218,8 +248,12 @@ class BatchStockService:
             
             # Generate summary message
             summary_message = self._generate_summary_message(
-                total_entries, successful_entries, failed_entries, success_rate, rollback_performed
+                total_entries, successful_entries, failed_entries, success_rate, rollback_performed,
+                successful_movements, failed_movements
             )
+            
+            # Extract movement IDs for BatchResult (keeping objects for summary generation)
+            successful_movement_ids = [movement.id if movement.id else f"movement_{i}" for i, movement in enumerate(successful_movements)]
             
             # Create batch result
             batch_result = BatchResult(
@@ -227,7 +261,7 @@ class BatchStockService:
                 successful_entries=successful_entries,
                 failed_entries=failed_entries,
                 success_rate=success_rate,
-                movements_created=successful_movements,
+                movements_created=successful_movement_ids,  # Use IDs for this field
                 errors=errors,
                 rollback_performed=rollback_performed,
                 processing_time_seconds=round(processing_time, 2),
@@ -365,18 +399,55 @@ class BatchStockService:
         return suggestion
     
     def _generate_summary_message(self, total: int, successful: int, failed: int, 
-                                success_rate: float, rollback_performed: bool) -> str:
+                                success_rate: float, rollback_performed: bool, 
+                                successful_movements: list = None, failed_movements: list = None) -> str:
         """Generate a comprehensive summary message for the batch operation."""
         if rollback_performed:
             return f"⚠️ Batch processing failed: {failed}/{total} entries had errors. All operations were rolled back due to critical failures."
         elif failed == 0:
-            return f"✅ Batch processing successful: All {total} entries processed successfully!"
+            # Show successful items
+            success_items = []
+            if successful_movements:
+                for movement in successful_movements[:5]:  # Show first 5
+                    success_items.append(f"✅ {movement.item_name}: {movement.quantity} {movement.unit}")
+                if len(successful_movements) > 5:
+                    success_items.append(f"... and {len(successful_movements) - 5} more items")
+            
+            message = f"✅ Batch processing successful: All {total} entries processed successfully!"
+            if success_items:
+                message += f"\n\n📋 Items processed:\n" + "\n".join(success_items)
+            return message
+            
         elif successful == 0:
             return f"❌ Batch processing failed: None of the {total} entries could be processed."
         else:
+            # Mixed results - show both successful and failed items
+            status_emoji = "⚠️"
             if success_rate >= 75:
-                return f"⚠️ Mostly successful: {successful}/{total} entries processed successfully ({success_rate:.1f}% success rate). {failed} entries failed."
+                status_text = "Mostly successful"
             elif success_rate >= 50:
-                return f"⚠️ Partial success: {successful}/{total} entries processed successfully ({success_rate:.1f}% success rate). {failed} entries failed."
+                status_text = "Partial success"
             else:
-                return f"⚠️ Mostly failed: Only {successful}/{total} entries processed successfully ({success_rate:.1f}% success rate). {failed} entries failed."
+                status_text = "Mostly failed"
+            
+            message = f"{status_emoji} {status_text}: {successful}/{total} entries processed successfully ({success_rate:.1f}% success rate)."
+            
+            # Add successful items
+            if successful_movements:
+                success_items = []
+                for movement in successful_movements[:3]:
+                    success_items.append(f"✅ {movement.item_name}: {movement.quantity} {movement.unit}")
+                if len(successful_movements) > 3:
+                    success_items.append(f"... and {len(successful_movements) - 3} more")
+                message += f"\n\n📋 Successful items:\n" + "\n".join(success_items)
+            
+            # Add failed items
+            if failed_movements:
+                failed_items = []
+                for movement in failed_movements[:3]:
+                    failed_items.append(f"❌ {movement.item_name}: {movement.quantity} {movement.unit}")
+                if len(failed_movements) > 3:
+                    failed_items.append(f"... and {len(failed_movements) - 3} more")
+                message += f"\n\n⚠️ Failed items:\n" + "\n".join(failed_items)
+            
+            return message

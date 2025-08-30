@@ -18,12 +18,14 @@ try:
         BatchFormat, BatchParseResult, BatchError, BatchErrorType
     )
     from .utils.error_handling import ErrorHandler
+    from .services.category_parser import category_parser
 except ImportError:
     from schemas import (
         StockMovement, MovementType, MovementStatus,
         BatchFormat, BatchParseResult, BatchError, BatchErrorType
     )
     from utils.error_handling import ErrorHandler
+    from services.category_parser import category_parser
 
 
 class NLPStockParser:
@@ -395,36 +397,23 @@ class NLPStockParser:
             # Remove any remaining command prefixes from the entry
             entry = re.sub(r'^(/in|/out|/adjust|in|out|adjust)\s+', '', entry.strip(), count=1)
             
-            # First, try to find the quantity and unit to determine where the item name ends
-            # Look for patterns like "X pieces", "X kgs", "X bags", etc.
-            # We need to be more careful about not matching dimensions like "100x20mm" or "110mm"
-            # Look for the pattern: number + space + unit (but not dimensions)
-            # Also handle negative numbers properly
-            qty_unit_match = re.search(r'(-?\d+(?:\.\d+)?)\s+(pieces?|kgs?|bags?|sets?|units?|liters?|meters?|tons?|boxes?|rolls?|sheets?|bundles?|pairs?|dozens?|hundreds?|thousands?)(?:\s|$|,|;)', entry, re.IGNORECASE)
-            
-            if qty_unit_match:
-                # Found quantity and unit - everything before this is the item name
-                qty_start = qty_unit_match.start()
-                item_name = entry[:qty_start].strip().rstrip(',')
-                quantity = float(qty_unit_match.group(1))
-                unit = qty_unit_match.group(2).lower()
+            # Smart comma-separated parsing - handles all formats: "Item Description, Quantity"
+            all_numbers = re.findall(r'(-?\d+(?:\.\d+)?)', entry)
+            if len(all_numbers) >= 1:  # At least 1 number (quantity)
+                # Use the last number as quantity
+                quantity = float(all_numbers[-1])
                 
-                # Normalize unit
-                if unit.endswith('s'):
-                    unit = unit[:-1]  # Remove plural
+                # Everything before the last comma is the item name
+                if ',' in entry:
+                    item_name = entry.rsplit(',', 1)[0].strip()
+                    remaining = entry.rsplit(',', 1)[1].strip()
+                else:
+                    # Fallback: everything before the last number
+                    last_num_pos = entry.rfind(all_numbers[-1])
+                    item_name = entry[:last_num_pos].strip()
+                    remaining = entry[last_num_pos:].strip()
                 
-                # Validate unit
-                if unit not in self.units:
-                    # Try to find a similar unit
-                    for valid_unit in self.units:
-                        if valid_unit in unit or unit in valid_unit:
-                            unit = valid_unit
-                            break
-                    else:
-                        unit = 'piece'  # Default fallback
-                
-                # Extract remaining parts for location, notes, etc.
-                remaining = entry[qty_unit_match.end():].strip()
+                # Extract components from remaining parts
                 parts = [part.strip() for part in remaining.split(',') if part.strip()]
                 
                 # Extract components
@@ -433,11 +422,9 @@ class NLPStockParser:
                 
                 # Extract location based on movement type
                 if movement_type == MovementType.IN:
-                    # For stock IN: extract "from location" (source)
                     from_location = self._extract_from_location(parts)
                     to_location = None
                 else:
-                    # For stock OUT/ADJUST: extract "to location" (destination)
                     from_location = None
                     to_location = self._extract_to_location(parts)
                 
@@ -446,71 +433,36 @@ class NLPStockParser:
                 if not item_name:
                     return None
                 
-                # Create movement
-                movement = StockMovement(
-                    item_name=item_name,
-                    movement_type=movement_type,
-                    quantity=quantity,
-                    unit=unit,
-                    signed_base_quantity=quantity,  # Will be converted later
-                    location=location,
-                    note=note,
-                    status=MovementStatus.POSTED,
-                    user_id=str(user_id),
-                    user_name=user_name,
-                    timestamp=datetime.now(UTC),
-                    driver_name=driver_name,  # Keep entry-specific driver if found
-                    from_location=from_location,
-                    to_location=to_location,
-                    project=None  # Set to None initially, will be filled by apply_global_parameters
-                )
-                
-                return movement
-            else:
-                # Fallback to old method if no clear quantity pattern found
-                parts = self._smart_split(entry)
-                
-                # Extract components
-                item_name = self._extract_item_name(parts)
-                quantity, unit = self._extract_quantity_unit(parts)
-                location = self._extract_location(parts)
-                driver_name = self._extract_driver(parts)
-                
-                # Extract location based on movement type
-                if movement_type == MovementType.IN:
-                    # For stock IN: extract "from location" (source)
-                    from_location = self._extract_from_location(parts)
-                    to_location = None
-                else:
-                    # For stock OUT/ADJUST: extract "to location" (destination)
-                    from_location = None
-                    to_location = self._extract_to_location(parts)
-                
-                note = self._extract_note(parts)
-                
-                if not item_name or not quantity:
-                    return None
+                # Auto-detect category for the item
+                try:
+                    item_category = category_parser.parse_category(item_name)
+                except Exception as e:
+                    item_category = None
                 
                 # Create movement
                 movement = StockMovement(
                     item_name=item_name,
                     movement_type=movement_type,
                     quantity=quantity,
-                    unit=unit,
-                    signed_base_quantity=quantity,  # Will be converted later
+                    unit='piece',  # Default to piece for all entries
+                    signed_base_quantity=quantity,
                     location=location,
                     note=note,
                     status=MovementStatus.POSTED,
                     user_id=str(user_id),
                     user_name=user_name,
                     timestamp=datetime.now(UTC),
-                    driver_name=driver_name,  # Keep entry-specific driver if found
+                    driver_name=driver_name,
                     from_location=from_location,
                     to_location=to_location,
-                    project=None  # Set to None initially, will be filled by apply_global_parameters
+                    project=None,
+                    category=item_category
                 )
                 
                 return movement
+            
+            # If no numbers found at all, this entry is invalid
+            return None
             
         except Exception as e:
             print(f"Error parsing single entry: {e}")

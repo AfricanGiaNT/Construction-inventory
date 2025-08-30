@@ -36,6 +36,7 @@ class BatchFormat(str, Enum):
     SINGLE = "single"
     NEWLINE = "newline"
     SEMICOLON = "semicolon"
+    COMMA_SEPARATED = "comma_separated"
     MIXED = "mixed"
 
 
@@ -58,7 +59,10 @@ class Item(BaseModel):
     name: str = Field(..., description="Item name")
     sku: Optional[str] = None  # Optional SKU for future use
     description: Optional[str] = None  # Aliases field
-    base_unit: str
+    base_unit: str  # Base unit of measurement (e.g., "ltrs", "kg", "m")
+    unit_size: float = Field(default=1.0, gt=0, description="Size of each unit (e.g., 20 for 20ltr cans)")
+    unit_type: str = Field(default="piece", description="Type of unit (e.g., 'ltrs', 'kg', 'm', 'piece')")
+    total_volume: Optional[float] = Field(default=None, description="Auto-calculated total volume (unit_size × quantity)")
     units: List[Unit]
     on_hand: float = 0.0
     threshold: Optional[float] = None  # Reorder Level field
@@ -68,6 +72,10 @@ class Item(BaseModel):
     is_active: Optional[bool] = True  # Is Active field
     last_stocktake_date: Optional[str] = None  # Last Stocktake Date field
     last_stocktake_by: Optional[str] = None  # Last Stocktake By field
+    
+    def get_total_volume(self) -> float:
+        """Calculate total volume as unit_size × on_hand quantity."""
+        return self.unit_size * self.on_hand
 
 
 class StockMovement(BaseModel):
@@ -78,6 +86,8 @@ class StockMovement(BaseModel):
     quantity: float
     unit: str
     signed_base_quantity: float
+    unit_size: Optional[float] = Field(default=None, description="Size of each unit for enhanced items")
+    unit_type: Optional[str] = Field(default=None, description="Type of unit for enhanced items")
     location: Optional[str] = None
     note: Optional[str] = None
     status: MovementStatus = MovementStatus.POSTED
@@ -93,6 +103,7 @@ class StockMovement(BaseModel):
     to_location: Optional[str] = None  # To Location field (destination for OUT/ADJUST)
     project: Optional[str] = None  # Project field
     batch_id: Optional[str] = None  # New field to track which batch this movement belongs to
+    category: Optional[str] = None  # Category field for stock movements
 
 
 class BatchParseResult(BaseModel):

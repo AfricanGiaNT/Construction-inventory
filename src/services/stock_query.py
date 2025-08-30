@@ -5,8 +5,9 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 from difflib import SequenceMatcher
 
-from ..schemas import Item, StockMovement
-from ..airtable_client import AirtableClient
+from schemas import Item, StockMovement
+from airtable_client import AirtableClient
+from services.category_parser import category_parser
 
 logger = logging.getLogger(__name__)
 
@@ -294,3 +295,148 @@ class StockQueryService:
             "expired_entries": expired_entries,
             "cache_ttl_days": self._cache_ttl.days
         }
+    
+    async def search_by_category(self, category_query: str, limit: int = 10) -> List[Item]:
+        """
+        Search for items by category.
+        
+        Args:
+            category_query: Category to search for (can be partial)
+            limit: Maximum number of results to return
+            
+        Returns:
+            List of items in the specified category
+        """
+        try:
+            # First, search for matching categories
+            matching_categories = category_parser.search_categories(category_query)
+            
+            if not matching_categories:
+                logger.info(f"No categories found matching '{category_query}'")
+                return []
+            
+            # Get all items from Airtable
+            all_items = await self.airtable.get_all_items()
+            if not all_items:
+                return []
+            
+            # Filter items by matching categories
+            category_items = []
+            for item in all_items:
+                if item.category and any(cat.lower() in item.category.lower() for cat in matching_categories):
+                    category_items.append(item)
+            
+            # Sort by name for consistent results
+            category_items.sort(key=lambda x: x.name.lower())
+            
+            # Limit results
+            return category_items[:limit]
+            
+        except Exception as e:
+            logger.error(f"Error searching by category '{category_query}': {e}")
+            return []
+    
+    async def get_items_by_category(self, category: str) -> List[Item]:
+        """
+        Get all items in a specific category.
+        
+        Args:
+            category: Exact category name
+            
+        Returns:
+            List of items in the category
+        """
+        try:
+            # Validate the category
+            if not category_parser.validate_category(category):
+                logger.warning(f"Invalid category: {category}")
+                return []
+            
+            # Get all items from Airtable
+            all_items = await self.airtable.get_all_items()
+            if not all_items:
+                return []
+            
+            # Filter items by exact category match
+            category_items = [
+                item for item in all_items 
+                if item.category and item.category.lower() == category.lower()
+            ]
+            
+            # Sort by name for consistent results
+            category_items.sort(key=lambda x: x.name.lower())
+            
+            return category_items
+            
+        except Exception as e:
+            logger.error(f"Error getting items by category '{category}': {e}")
+            return []
+    
+    async def get_low_stock_by_category(self, category: str = None) -> List[Item]:
+        """
+        Get low stock items, optionally filtered by category.
+        
+        Args:
+            category: Optional category to filter by
+            
+        Returns:
+            List of low stock items
+        """
+        try:
+            # Get low stock items
+            low_stock_items = await self.airtable.get_low_stock_items()
+            
+            if not category:
+                return low_stock_items
+            
+            # Filter by category if specified
+            category_low_stock = [
+                item for item in low_stock_items
+                if item.category and item.category.lower() == category.lower()
+            ]
+            
+            return category_low_stock
+            
+        except Exception as e:
+            logger.error(f"Error getting low stock by category '{category}': {e}")
+            return []
+    
+    async def get_category_overview(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Get an overview of all categories with item counts and stock levels.
+        
+        Returns:
+            Dictionary with category information
+        """
+        try:
+            # Get all items
+            all_items = await self.airtable.get_all_items()
+            if not all_items:
+                return {}
+            
+            # Group items by category
+            category_stats = {}
+            for item in all_items:
+                category = item.category or "Uncategorized"
+                
+                if category not in category_stats:
+                    category_stats[category] = {
+                        "item_count": 0,
+                        "total_stock": 0.0,
+                        "low_stock_count": 0,
+                        "items": []
+                    }
+                
+                category_stats[category]["item_count"] += 1
+                category_stats[category]["total_stock"] += item.on_hand
+                category_stats[category]["items"].append(item.name)
+                
+                # Check if item is low stock
+                if item.threshold and item.on_hand <= item.threshold:
+                    category_stats[category]["low_stock_count"] += 1
+            
+            return category_stats
+            
+        except Exception as e:
+            logger.error(f"Error getting category overview: {e}")
+            return {}

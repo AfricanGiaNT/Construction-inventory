@@ -4,9 +4,9 @@ import logging
 from datetime import datetime, UTC
 from typing import List, Optional, Tuple, Dict, Any
 
-from ..schemas import MovementStatus, UserRole, BatchResult
-from ..airtable_client import AirtableClient
-from .batch_stock import BatchStockService
+from schemas import MovementStatus, UserRole, BatchResult
+from airtable_client import AirtableClient
+from services.batch_stock import BatchStockService
 
 logger = logging.getLogger(__name__)
 

@@ -6,7 +6,7 @@ from typing import List, Optional, Dict, Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.error import TelegramError
 
-from .schemas import StockMovement, MovementType, Item
+from schemas import StockMovement, MovementType, Item
 
 # Settings will be passed in constructor
 
@@ -218,9 +218,25 @@ class TelegramService:
             # Create detailed item information text
             text = f"📦 <b>Item Details: {item.name}</b>\n\n"
             
-            # Basic stock information
-            text += f"<b>Stock Level:</b> {item.on_hand} {item.base_unit}\n"
-            text += f"<b>Reorder Threshold:</b> {item.threshold} {item.base_unit}\n"
+            # Enhanced stock information with unit structure
+            if item.unit_size > 1.0 and item.unit_type != "piece":
+                # Show both unit count and total volume for enhanced items
+                total_volume = item.get_total_volume()
+                text += f"<b>Stock Level:</b> {item.on_hand} units × {item.unit_size} {item.unit_type} = {total_volume} {item.unit_type}\n"
+                text += f"<b>Unit Size:</b> {item.unit_size} {item.unit_type}\n"
+                text += f"<b>Unit Type:</b> {item.unit_type}\n"
+                text += f"<b>Base Unit:</b> {item.base_unit}\n"
+            else:
+                # Standard display for regular items
+                text += f"<b>Stock Level:</b> {item.on_hand} {item.base_unit}\n"
+                text += f"<b>Unit Size:</b> 1 {item.base_unit}\n"
+            
+            if item.threshold:
+                if item.unit_size > 1.0 and item.unit_type != "piece":
+                    threshold_volume = item.threshold * item.unit_size
+                    text += f"<b>Reorder Threshold:</b> {item.threshold} units ({threshold_volume} {item.unit_type})\n"
+                else:
+                    text += f"<b>Reorder Threshold:</b> {item.threshold} {item.base_unit}\n"
             
             if item.location:
                 text += f"<b>Preferred Location:</b> {item.location}\n"
@@ -229,7 +245,11 @@ class TelegramService:
                 text += f"<b>Category:</b> {item.category}\n"
             
             if item.large_qty_threshold:
-                text += f"<b>Large Qty Threshold:</b> {item.large_qty_threshold} {item.base_unit}\n"
+                if item.unit_size > 1.0 and item.unit_type != "piece":
+                    large_qty_volume = item.large_qty_threshold * item.unit_size
+                    text += f"<b>Large Qty Threshold:</b> {item.large_qty_threshold} units ({large_qty_volume} {item.unit_type})\n"
+                else:
+                    text += f"<b>Large Qty Threshold:</b> {item.large_qty_threshold} {item.base_unit}\n"
             
             # Pending information
             if pending_movements:
@@ -310,7 +330,15 @@ class TelegramService:
                 # Format the change with sign
                 change_str = f"{change:+.2f}" if change else "0.00"
                 
-                text += f"• {direction} <b>{item_name}</b>: {abs(movement.quantity)} {movement.unit}\n"
+                # Enhanced movement display with unit context
+                if hasattr(movement, 'unit_size') and movement.unit_size and movement.unit_size > 1.0:
+                    # Show both units and total volume for enhanced items
+                    total_volume = abs(movement.quantity) * movement.unit_size
+                    text += f"• {direction} <b>{item_name}</b>: {abs(movement.quantity)} units × {movement.unit_size} {movement.unit} = {total_volume} {movement.unit}\n"
+                else:
+                    # Standard display for regular items
+                    text += f"• {direction} <b>{item_name}</b>: {abs(movement.quantity)} {movement.unit}\n"
+                
                 text += f"  Stock: {before} → {after} ({change_str})\n"
             
             # Add failed entries if any
@@ -461,7 +489,7 @@ class TelegramService:
         """Send filtered help message based on search term."""
         try:
             # Import the command suggestions service to get dynamic command data
-            from .services.command_suggestions import CommandSuggestionsService
+            from services.command_suggestions import CommandSuggestionsService
             cmd_service = CommandSuggestionsService()
             
             # Get commands by category

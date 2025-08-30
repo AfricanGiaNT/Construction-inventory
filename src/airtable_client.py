@@ -8,7 +8,7 @@ from pyairtable import Api, Base, Table
 from pyairtable.formulas import match
 
 # Settings will be passed in constructor
-from .schemas import Item, StockMovement, TelegramUser, UserRole
+from schemas import Item, StockMovement, TelegramUser, UserRole
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,10 @@ class AirtableClient:
                 large_qty_threshold=record["fields"].get("Large Qty Threshold"),
                 is_active=record["fields"].get("Is Active", True),
                 last_stocktake_date=record["fields"].get("Last Stocktake Date"),
-                last_stocktake_by=record["fields"].get("Last Stocktake By")
+                last_stocktake_by=record["fields"].get("Last Stocktake By"),
+                # New fields for enhanced item structure
+                unit_size=record["fields"].get("Unit Size", 1.0),
+                unit_type=record["fields"].get("Unit Type", "piece")
             )
         except Exception as e:
             logger.error(f"Error getting item {item_name}: {e}")
@@ -83,7 +86,10 @@ class AirtableClient:
                         threshold=fields.get("Reorder Level"),
                         location=fields.get("Preferred Location", [None])[0] if fields.get("Preferred Location") else None,
                         category=fields.get("Category", ""),
-                        large_qty_threshold=fields.get("Large Qty Threshold")
+                        large_qty_threshold=fields.get("Large Qty Threshold"),
+                        # New fields for enhanced item structure
+                        unit_size=fields.get("Unit Size", 1.0),
+                        unit_type=fields.get("Unit Type", "piece")
                     ))
             
             return results[:10]  # Limit results
@@ -109,7 +115,10 @@ class AirtableClient:
                     threshold=fields.get("Reorder Level"),
                     location=fields.get("Preferred Location", [None])[0] if fields.get("Preferred Location") else None,
                     category=fields.get("Category", ""),
-                    large_qty_threshold=fields.get("Large Qty Threshold")
+                    large_qty_threshold=fields.get("Large Qty Threshold"),
+                    # New fields for enhanced item structure
+                    unit_size=fields.get("Unit Size", 1.0),
+                    unit_type=fields.get("Unit Type", "piece")
                 )
                 items.append(item)
             
@@ -120,6 +129,70 @@ class AirtableClient:
             logger.error(f"Error getting all items: {e}")
             return []
     
+    def _extract_unit_info_from_name(self, item_name: str) -> tuple[float, str]:
+        """
+        Extract unit size and type from item name if specified.
+        
+        Examples:
+        - "Paint 20ltrs" -> (20.0, "ltrs")
+        - "Cement 50kg" -> (50.0, "kg")
+        - "Steel Beam" -> (1.0, "piece")
+        
+        Returns:
+            Tuple of (unit_size, unit_type)
+        """
+        try:
+            # Pattern to match: ItemName NumberUnit (e.g., "Paint 20ltrs", "Cement 50kg")
+            import re
+            pattern = r'(.+?)\s+(\d+(?:\.\d+)?)([a-zA-Z]+)$'
+            match = re.match(pattern, item_name.strip())
+            
+            if match:
+                base_name = match.group(1).strip()
+                unit_size = float(match.group(2))
+                unit_type = match.group(3).lower()
+                
+                # Validate unit_size
+                if unit_size <= 0:
+                    logger.warning(f"Invalid unit_size {unit_size} extracted from {item_name}, defaulting to 1.0")
+                    return 1.0, "piece"
+                
+                # Map common unit types to standardized values
+                unit_type_mapping = {
+                    "ltrs": "ltrs",
+                    "litres": "ltrs",
+                    "ltr": "ltrs",
+                    "kg": "kg",
+                    "kgs": "kg",
+                    "ton": "ton",
+                    "tons": "ton",
+                    "m": "m",
+                    "meter": "m",
+                    "meters": "m",
+                    "bag": "bag",
+                    "bags": "bag",
+                    "piece": "piece",
+                    "pieces": "piece"
+                }
+                
+                # Special handling for thickness specifications (mm, cm, etc.)
+                thickness_patterns = ["mm", "cm", "inch", "inches"]
+                if unit_type in thickness_patterns:
+                    logger.info(f"'{unit_type}' detected as thickness specification for '{item_name}', using unit 'piece'")
+                    return 1.0, "piece"
+                
+                standardized_unit_type = unit_type_mapping.get(unit_type, unit_type)
+                
+                logger.info(f"Extracted unit info from '{item_name}': size={unit_size}, type={standardized_unit_type}")
+                return unit_size, standardized_unit_type
+            
+            # No unit info found, return defaults
+            return 1.0, "piece"
+            
+        except Exception as e:
+            logger.warning(f"Error extracting unit info from '{item_name}': {e}, using defaults")
+            return 1.0, "piece"
+
     async def test_connection(self) -> bool:
         """Test the connection to Airtable."""
         try:
@@ -130,13 +203,30 @@ class AirtableClient:
             logger.error(f"Airtable connection test failed: {e}")
             return False
     
-    async def create_item_if_not_exists(self, item_name: str, base_unit: str = "piece", category: str = "General") -> Optional[str]:
+    async def create_item_if_not_exists(self, item_name: str, base_unit: str = "piece", category: str = "General", 
+                                      unit_size: float = 1.0, unit_type: str = "piece") -> Optional[str]:
         """Create a new item if it doesn't exist."""
         try:
             # Check if item already exists
             existing_item = await self.get_item(item_name)
             if existing_item:
                 return existing_item.name  # Return existing item name as ID
+            
+            # Validate unit_size
+            if unit_size <= 0:
+                logger.warning(f"Invalid unit_size {unit_size} for {item_name}, defaulting to 1.0")
+                unit_size = 1.0
+            
+            # Validate unit_type
+            if not unit_type or unit_type.strip() == "":
+                logger.warning(f"Empty unit_type for {item_name}, defaulting to 'piece'")
+                unit_type = "piece"
+            
+            # Handle thickness specifications (mm, cm, etc.) - these should use 'piece' unit
+            thickness_patterns = ["mm", "cm", "inch", "inches"]
+            if unit_type in thickness_patterns:
+                logger.info(f"'{unit_type}' detected as thickness specification for '{item_name}', using unit 'piece'")
+                unit_type = "piece"
             
             # Map common units to valid Airtable options (based on existing data)
             unit_mapping = {
@@ -153,27 +243,65 @@ class AirtableClient:
             }
             
             # Map common categories to valid Airtable options (based on existing data)
+            # Use only categories that are confirmed to exist in Airtable
+            # Note: Airtable categories are case-sensitive, so we map to exact values
             category_mapping = {
-                "general": "Steel",  # Default to existing category
+                "general": "General",  # Default to General category
                 "steel": "Steel",
                 "electrical": "Electrical", 
-                "cement": "Cement",
-                "plumbing": "Steel",  # Default to existing
-                "safety": "Steel",  # Default to existing
-                "tools": "Steel",  # Default to existing
-                "equipment": "Steel"  # Default to existing
+                "paint": "Paint",  # Map paint to existing Paint category
+                "white": "Paint",  # Map white to Paint category
+                "bitumec": "Paint",  # Map bitumec to Paint category
+                "litres": "Paint",  # Map litres to Paint category
+                "wire": "Electrical",  # Map wire to Electrical category
+                "cable": "Electrical",  # Map cable to Electrical category
+                "beam": "Steel",  # Map beam to Steel category
+                "plate": "Steel",  # Map plate to Steel category
+                "angle": "Steel",  # Map angle to Steel category
+                "cement": "General",  # Map cement to General (since Cement doesn't exist)
+                "concrete": "General",  # Map concrete to General
+                "plumbing": "General",  # Map plumbing to General
+                "safety": "General",  # Map safety to General
+                "tools": "General",  # Map tools to General
+                "equipment": "General"  # Map equipment to General
             }
             
             # Use mapped unit or default to existing valid option
             valid_unit = unit_mapping.get(base_unit.lower(), "meter")  # Default to existing option
             
-            # Use mapped category or default to existing valid option
-            valid_category = category_mapping.get(category.lower(), "Steel")  # Default to existing option
+            # Use mapped category or try to auto-detect from item name
+            # This ensures we only use categories that exist in Airtable
+            valid_category = None
             
-            # Create new item
+            if category:
+                # Handle case-insensitive matching for common categories
+                category_lower = category.lower()
+                valid_category = category_mapping.get(category_lower, None)
+            
+            # If no category mapping found, try to auto-detect from item name
+            if not valid_category:
+                item_lower = item_name.lower()
+                if any(paint_word in item_lower for paint_word in ['paint', 'white', 'bitumec', 'ltrs', 'litres']):
+                    valid_category = "Paint"
+                elif any(electrical_word in item_lower for electrical_word in ['wire', 'cable', 'electrical', 'electric']):
+                    valid_category = "Electrical"
+                elif any(steel_word in item_lower for steel_word in ['steel', 'beam', 'plate', 'angle']):
+                    valid_category = "Steel"
+                else:
+                    valid_category = "General"  # Default to General for everything else
+            
+            # Log the mapping for debugging
+            if category:
+                logger.info(f"Category mapping: '{category}' (lowercase: '{category.lower()}') → '{valid_category}'")
+            else:
+                logger.info(f"Auto-detected category from item name '{item_name}' → '{valid_category}'")
+            
+            # Create new item with enhanced fields
             record = {
                 "Name": item_name,
                 "Base Unit": valid_unit,
+                "Unit Size": unit_size,
+                "Unit Type": unit_type,
                 "Category": valid_category,
                 "On Hand": 0.0,
                 "Reorder Level": 10,  # Default threshold
@@ -181,7 +309,7 @@ class AirtableClient:
                 "Is Active": True
             }
             
-            logger.info(f"Creating new item: {item_name} with unit: {valid_unit}")
+            logger.info(f"Creating new item: {item_name} with unit: {valid_unit}, unit_size: {unit_size}, unit_type: {unit_type}")
             created = self.items_table.create(record)
             logger.info(f"Created new item: {item_name}")
             return created["id"]
@@ -225,38 +353,33 @@ class AirtableClient:
             record = {
                 "Name": movement.item_name,  # singleLineText - Primary field for Stock Movements
                 "Type": movement.movement_type.value.title(),  # singleSelect
-                "Qty Entered": movement.quantity,  # number
-                "Unit Entered": movement.unit,  # singleSelect
-                "Signed Base Qty": movement.signed_base_quantity,  # number
-                "Note": movement.note or "",  # multilineText
+                "Quantity": movement.quantity,  # number - CORRECT field name
+                "Unit": movement.unit,  # singleSelect - CORRECT field name
                 "Status": movement.status.value.title(),  # singleSelect
                 "Requested By": [person_id] if person_id else [],  # multipleRecordLinks
                 "Source": "Telegram",  # singleSelect
                 "Created At": movement.timestamp.strftime("%Y-%m-%d"),  # date
                 "Reason": "Issue" if movement.movement_type.value == "Out" else "Purchase" if movement.movement_type.value == "In" else "Adjustment",  # singleSelect
-                "Item": movement.item_name,  # singleLineText
                 # Note: Item Category and Item Base Unit are lookup fields, not directly settable
                 # Note: Is Posted is a formula field, not directly settable
                 # Note: Posted Qty exists but may be calculated differently
             }
             
+            # Add category field if available
+            if hasattr(movement, 'category') and movement.category:
+                # Clean up hierarchical categories (e.g., "Steel > Beams" -> "Steel")
+                clean_category = movement.category.split(' > ')[0] if ' > ' in movement.category else movement.category
+                logger.info(f"Adding category '{clean_category}' to movement record for {movement.item_name} (original: {movement.category})")
+                record["Category"] = clean_category
+            else:
+                logger.warning(f"Category field missing or empty for movement {movement.item_name}: hasattr={hasattr(movement, 'category')}, category={getattr(movement, 'category', 'NOT_SET')}")
+            
             # Add driver name if specified
             if movement.driver_name:
-                record["Driver's Name"] = movement.driver_name
+                record["Driver Name"] = movement.driver_name
             
-            # Add from/to location if specified
-            if movement.from_location:
-                record["From/To Location"] = movement.from_location
-            
-            # Add location if specified
-            if movement.location:
-                location_id = await self._get_location_id_by_name(movement.location)
-                if location_id:
-                    record["Location"] = [location_id]
-            
-            # Add project if specified - using the correct field name "From/To Project"
-            if movement.project:
-                record["From/To Project"] = movement.project
+            # Note: Location and Project fields are not available in current Airtable schema
+            # These fields were removed to match the actual table structure
             
             # Add Telegram Users link (should link to Telegram User record, not Person)
             telegram_user_id = await self._get_telegram_user_record_id(movement.user_id)
@@ -268,10 +391,15 @@ class AirtableClient:
             if not item:
                 # Create new item if it doesn't exist
                 logger.info(f"Creating new item: {movement.item_name}")
+                # Extract unit size and type from item name if specified
+                unit_size, unit_type = self._extract_unit_info_from_name(movement.item_name)
+                
                 item_id = await self.create_item_if_not_exists(
                     movement.item_name, 
                     movement.unit, 
-                    "General"  # Default category
+                    None,  # Let the method auto-detect category from item name
+                    unit_size,
+                    unit_type
                 )
                 if item_id:
                     logger.info(f"Item created successfully: {movement.item_name}")
@@ -282,7 +410,9 @@ class AirtableClient:
                 logger.info(f"Using existing item: {movement.item_name}")
             
             # Create the movement record
+            logger.info(f"Creating movement record with data: {record}")
             created = self.movements_table.create(record)
+            logger.info(f"Movement record created successfully: {created.get('id', 'NO_ID')}")
             
             # Automatically update item stock
             if created["id"]:
@@ -358,8 +488,8 @@ class AirtableClient:
                 {
                     "id": record["id"],
                     "item_name": await self._get_item_name_by_id(record["fields"].get("Item", [None])[0]),
-                    "quantity": record["fields"].get("Qty Entered"),
-                    "unit": record["fields"].get("Unit Entered"),
+                                    "quantity": record["fields"].get("Quantity"),
+                "unit": record["fields"].get("Unit"),
                     "user_name": await self._get_person_name_by_id(record["fields"].get("Requested By", [None])[0]),
                     "timestamp": record["fields"].get("Created At")
                 }
@@ -382,7 +512,7 @@ class AirtableClient:
             for record in records:
                 if record["fields"].get("Status") == "Posted":
                     movements_count += 1
-                    quantity = record["fields"].get("Signed Base Qty", 0.0)
+                    quantity = record["fields"].get("Quantity", 0.0)
                     
                     if record["fields"].get("Type") == "In":
                         total_in += quantity
@@ -821,4 +951,56 @@ class AirtableClient:
             
         except Exception as e:
             logger.error(f"Error updating provenance fields for item '{item_name}': {e}")
+            return False
+    
+    async def update_item_category(self, item_name: str, new_category: str) -> bool:
+        """Update the category field for an item."""
+        try:
+            # Find the item record
+            formula = match({"Name": item_name})
+            records = self.items_table.all(formula=formula, max_records=1)
+            
+            if not records:
+                logger.warning(f"Item '{item_name}' not found for category update")
+                return False
+            
+            record_id = records[0]["id"]
+            
+            # Update the category field
+            update_data = {
+                "Category": new_category
+            }
+            
+            self.items_table.update(record_id, update_data)
+            logger.info(f"Updated category for item '{item_name}' to '{new_category}'")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating category for item '{item_name}': {e}")
+            return False
+    
+    async def update_item_base_unit(self, item_name: str, new_base_unit: str) -> bool:
+        """Update the base unit field for an item."""
+        try:
+            # Find the item record
+            formula = match({"Name": item_name})
+            records = self.items_table.all(formula=formula, max_records=1)
+            
+            if not records:
+                logger.warning(f"Item '{item_name}' not found for base unit update")
+                return False
+            
+            record_id = records[0]["id"]
+            
+            # Update the base unit field
+            update_data = {
+                "Base Unit": new_base_unit
+            }
+            
+            self.items_table.update(record_id, update_data)
+            logger.info(f"Updated base unit for item '{item_name}' to '{new_base_unit}'")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating base unit for item '{item_name}': {e}")
             return False

@@ -6,7 +6,8 @@ from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
-from ..schemas import Item
+from schemas import Item
+from services.category_parser import category_parser
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +17,9 @@ class InventoryHeader:
     """Parsed inventory header information."""
     date: str  # DD/MM/YY format
     logged_by: List[str]  # List of names
-    raw_text: str
-    normalized_date: str  # ISO YYYY-MM-DD format
+    category: Optional[str] = None  # Optional category override
+    raw_text: str = ""
+    normalized_date: str = ""  # ISO YYYY-MM-DD format
 
 
 @dataclass
@@ -111,17 +113,26 @@ class InventoryParser:
         )
 
     def _parse_header(self, header_line: str) -> Optional[InventoryHeader]:
-        """Parse the header line for date and logged by information."""
-        # Pattern: date:DD/MM/YY logged by: NAME1,NAME2 or date:DD/MM/YY logged_by: NAME1,NAME2
-        # Allow flexible whitespace and variations
-        pattern = r'date:\s*(\d{1,2}/\d{1,2}/\d{2})\s+(?:logged\s+by|logged_by):\s*(.+)'
-        match = re.match(pattern, header_line, re.IGNORECASE)
-
-        if not match:
+        """Parse the header line for date, logged by, and optional category information."""
+        # Pattern: date:DD/MM/YY logged by: NAME1,NAME2 [category: CATEGORY]
+        # Allow flexible whitespace and variations, category can be anywhere
+        # First, extract the date
+        date_match = re.search(r'date:\s*(\d{1,2}/\d{1,2}/\d{2})', header_line, re.IGNORECASE)
+        if not date_match:
             return None
-
-        date_str = match.group(1)
-        logged_by_text = match.group(2).strip()
+        
+        date_str = date_match.group(1)
+        
+        # Extract logged by
+        logged_by_match = re.search(r'(?:logged\s+by|logged_by):\s*(.+?)(?=\s+category:|$)', header_line, re.IGNORECASE)
+        if not logged_by_match:
+            return None
+        
+        logged_by_text = logged_by_match.group(1).strip()
+        
+        # Extract category if present
+        category_match = re.search(r'category:\s*([^\s]+)', header_line, re.IGNORECASE)
+        category = category_match.group(1).strip() if category_match else None
 
         # Validate date format
         if not self._is_valid_date(date_str):
@@ -139,6 +150,7 @@ class InventoryParser:
         return InventoryHeader(
             date=date_str,
             logged_by=logged_by,
+            category=category,
             raw_text=header_line,
             normalized_date=normalized_date
         )
@@ -233,9 +245,17 @@ class InventoryParser:
         if not item_name:
             return None
 
-        # Validate and parse quantity
+        # Validate and parse quantity (allow units like "5 cans" → 5.0)
         try:
-            quantity = float(quantity_str)
+            # Extract numeric part from quantity string (e.g., "5 cans" → "5")
+            import re
+            quantity_match = re.search(r'(\d+(?:\.\d+)?)', quantity_str)
+            if quantity_match:
+                quantity = float(quantity_match.group(1))
+            else:
+                # Try to parse the entire string as a number
+                quantity = float(quantity_str)
+            
             # Check for special values
             if quantity != quantity:  # NaN check
                 return None
@@ -316,6 +336,67 @@ class InventoryService:
         self.audit_trail_service = audit_trail_service
         self.persistent_idempotency_service = persistent_idempotency_service
 
+    def _extract_unit_info_from_name(self, item_name: str) -> Tuple[float, str]:
+        """
+        Extract unit size and type from item name if specified.
+        
+        Examples:
+        - "20 ltrs white shene" -> (20.0, "ltrs")
+        - "5 litres red oxide" -> (5.0, "litres")
+        - "Cement 50kg" -> (50.0, "kg")
+        - "Steel Beam" -> (1.0, "piece")
+        
+        Returns:
+            Tuple of (unit_size, unit_type)
+        """
+        try:
+            import re
+            
+            # First, try to match unit info anywhere in the item name (not just at the end)
+            # Pattern: Number + Unit (e.g., "20 ltrs", "5 litres", "50kg")
+            unit_pattern = r'(\d+(?:\.\d+)?)\s*([a-zA-Z]+)'
+            unit_matches = re.findall(unit_pattern, item_name)
+            
+            if unit_matches:
+                # Use the first unit match found
+                unit_size_str, unit_type = unit_matches[0]
+                unit_size = float(unit_size_str)
+                
+                # Validate unit_size
+                if unit_size <= 0:
+                    logger.warning(f"Invalid unit_size {unit_size} extracted from {item_name}, defaulting to 1.0")
+                    return 1.0, "piece"
+                
+                # Map common unit types to standardized values
+                unit_type_mapping = {
+                    "ltrs": "litre",
+                    "litres": "litre",
+                    "ltr": "litre",
+                    "kg": "kg",
+                    "kgs": "kg",
+                    "ton": "ton",
+                    "tons": "ton",
+                    "m": "m",
+                    "meter": "m",
+                    "meters": "m",
+                    "bag": "bag",
+                    "bags": "bag",
+                    "piece": "piece",
+                    "pieces": "piece"
+                }
+                
+                standardized_unit_type = unit_type_mapping.get(unit_type.lower(), unit_type.lower())
+                
+                logger.info(f"Extracted unit info from '{item_name}': size={unit_size}, type={standardized_unit_type}")
+                return unit_size, standardized_unit_type
+            
+            # No unit info found, return defaults
+            return 1.0, "piece"
+            
+        except Exception as e:
+            logger.warning(f"Error extracting unit info from '{item_name}': {e}, using defaults")
+            return 1.0, "piece"
+
     async def process_inventory_stocktake(self, command_text: str, user_id: int, user_name: str, 
                                        validate_only: bool = False) -> Tuple[bool, str]:
         """
@@ -348,11 +429,12 @@ class InventoryService:
                         error_message += f"• {parse_result.comment_lines} comment lines ignored\n"
                 
                 error_message += "\n<b>Expected Format:</b>\n"
-                error_message += "/inventory date:DD/MM/YY logged by: NAME1,NAME2\n"
+                error_message += "/inventory date:DD/MM/YY logged by: NAME1,NAME2 [category: CATEGORY]\n"
                 error_message += "Item Name, Quantity\n"
                 error_message += "Item Name, Quantity\n"
                 error_message += "\n💡 <b>Tips:</b>\n"
                 error_message += "• Use 'logged by:' or 'logged_by:' (both work)\n"
+                error_message += "• Use 'category: CATEGORY' to override auto-detection\n"
                 error_message += "• Comment lines starting with # are ignored\n"
                 error_message += "• Blank lines are ignored\n"
                 error_message += "• Maximum 50 entries allowed\n"
@@ -380,7 +462,7 @@ class InventoryService:
             failed_items = 0
 
             for entry in parse_result.entries:
-                result = await self._process_inventory_entry(entry, parse_result.header.normalized_date, user_name)
+                result = await self._process_inventory_entry(entry, parse_result.header.normalized_date, user_name, parse_result.header.category)
                 results.append(result)
 
                 if result["success"]:
@@ -428,6 +510,8 @@ class InventoryService:
         report = f"✅ <b>Inventory Command Validation Successful</b>\n\n"
         report += f"<b>Date:</b> {parse_result.header.date} (normalized to {parse_result.header.normalized_date})\n"
         report += f"<b>Logged by:</b> {', '.join(parse_result.header.logged_by)}\n"
+        if parse_result.header.category:
+            report += f"<b>Category Override:</b> {parse_result.header.category}\n"
         report += f"<b>Total lines:</b> {parse_result.total_lines}\n"
         report += f"<b>Valid entries:</b> {parse_result.valid_entries}\n"
         
@@ -441,13 +525,23 @@ class InventoryService:
         
         report += "\n📋 <b>Parsed Entries:</b>\n"
         for entry in parse_result.entries:
-            report += f"• {entry.item_name}: {entry.quantity}\n"
+            if parse_result.header.category:
+                # Use category override
+                detected_category = parse_result.header.category
+            else:
+                # Auto-detect category
+                detected_category = category_parser.parse_category(entry.item_name)
+            report += f"• {entry.item_name} → {detected_category}: {entry.quantity}\n"
         
         report += f"\n💡 <b>Ready to apply!</b> Use the same command without 'validate' to process."
+        if parse_result.header.category:
+            report += f"\n\n🔍 <b>Category Override Applied:</b> All items will use category '{parse_result.header.category}'"
+        else:
+            report += f"\n\n🔍 <b>Smart Category Detection:</b> Categories are automatically detected from item names."
         
         return report
 
-    async def _process_inventory_entry(self, entry: InventoryEntry, normalized_date: str, user_name: str) -> Dict:
+    async def _process_inventory_entry(self, entry: InventoryEntry, normalized_date: str, user_name: str, category_override: Optional[str] = None) -> Dict:
         """Process a single inventory entry."""
         try:
             # Check if item exists
@@ -456,6 +550,49 @@ class InventoryService:
             if existing_item:
                 # Store previous quantity for audit trail
                 previous_quantity = existing_item.on_hand
+                
+                # Update category and base unit if override is specified and different from current
+                if category_override and existing_item.category != category_override:
+                    try:
+                        # Apply the same category mapping logic used in create_item_if_not_exists
+                        # Map common categories to valid Airtable options
+                        category_mapping = {
+                            "general": "Steel",
+                            "steel": "Steel",
+                            "electrical": "Electrical", 
+                            "cement": "Cement",
+                            "paint": "Paint",  # Map paint to existing Paint category
+                            "plumbing": "Steel",
+                            "safety": "Steel",
+                            "tools": "Steel",
+                            "equipment": "Steel",
+                            "construction materials": "Construction Materials",
+                            "white": "Paint",
+                            "bitumec": "Paint",
+                            "litres": "Paint"
+                        }
+                        
+                        # Use mapped category or default to Steel if not mapped
+                        mapped_category = category_mapping.get(category_override.lower(), "Steel")
+                        
+                        await self.airtable.update_item_category(entry.item_name, mapped_category)
+                        logger.info(f"Updated {entry.item_name} category from {existing_item.category} to {mapped_category} (mapped from '{category_override}')")
+                        
+                        # Also update the base unit for paint items to use "litre" instead of "piece"
+                        if mapped_category == "Paint":
+                            # Extract unit info from item name to determine correct base unit
+                            unit_size, unit_type = self._extract_unit_info_from_name(entry.item_name)
+                            if unit_type and unit_type != "piece":
+                                # Update base unit to the extracted unit type
+                                await self.airtable.update_item_base_unit(entry.item_name, unit_type)
+                                logger.info(f"Updated {entry.item_name} base unit to {unit_type} (extracted from item name)")
+                            else:
+                                # Default to "litre" for paint items if no specific unit found
+                                await self.airtable.update_item_base_unit(entry.item_name, "litre")
+                                logger.info(f"Updated {entry.item_name} base unit to 'litre' (default for paint items)")
+                        
+                    except Exception as e:
+                        logger.warning(f"Failed to update category/base unit for {entry.item_name}: {e}")
                 
                 # Update existing item
                 success = await self._update_item_stock(entry.item_name, entry.quantity, existing_item, normalized_date, user_name)
@@ -478,26 +615,47 @@ class InventoryService:
                         "message": f"Failed to update {entry.item_name} stock"
                     }
             else:
-                # Create new item with defaults
+                # Create new item with enhanced defaults
                 try:
+                    # Extract unit size and type from item name if specified (e.g., "Paint 20ltrs")
+                    unit_size, unit_type = self._extract_unit_info_from_name(entry.item_name)
+                    
+                    # Use category override if provided, otherwise auto-detect
+                    if category_override:
+                        detected_category = category_override
+                    else:
+                        detected_category = category_parser.parse_category(entry.item_name)
+                    
+                    # Determine base unit from item name or use detected unit type
+                    # For paint items, use the extracted unit type (e.g., "litre" instead of "piece")
+                    if unit_type and unit_type != "piece":
+                        base_unit = unit_type
+                    else:
+                        # Fallback to piece for items without specific units
+                        base_unit = "piece"
+                    
+                    logger.info(f"Determined base unit for {entry.item_name}: {base_unit} (from unit_type: {unit_type})")
+                    
                     new_item_id = await self.airtable.create_item_if_not_exists(
                         item_name=entry.item_name,
-                        base_unit="piece",  # Default as specified in plan
-                        category="General"  # Default as specified in plan
+                        base_unit=base_unit,  # Dynamic based on item name
+                        category=detected_category,  # Use override or auto-detected category
+                        unit_size=unit_size,
+                        unit_type=unit_type
                     )
                     
                     if new_item_id:
                         # Set the stock level
                         stock_success = await self._update_item_stock(entry.item_name, entry.quantity, None, normalized_date, user_name)
                         if stock_success:
-                            return {
-                                "success": True,
-                                "created": True,
-                                "item_name": entry.item_name,
-                                "quantity": entry.quantity,
-                                "previous_quantity": 0.0,  # New items start with 0
-                                "message": f"Created {entry.item_name} with stock level {entry.quantity}"
-                            }
+                                                    return {
+                            "success": True,
+                            "created": True,
+                            "item_name": entry.item_name,
+                            "quantity": entry.quantity,
+                            "previous_quantity": 0.0,  # New items start with 0
+                            "message": f"Created {entry.item_name} (Category: {detected_category}) with stock level {entry.quantity}"
+                        }
                         else:
                             return {
                                 "success": False,
@@ -619,8 +777,31 @@ class InventoryService:
         # Add warnings for new items with default values
         if created_items > 0:
             summary += f"\n⚠️ <b>New Items Created:</b>\n"
-            summary += f"• {created_items} items created with default Base Unit='piece' and Category='General'\n"
-            summary += f"• These can be updated later with proper categorization\n"
+            summary += f"• {created_items} items created with enhanced structure\n"
+            summary += f"• Unit size and type extracted from item names (e.g., 'Paint 20ltrs' → size=20, type=ltrs)\n"
+            summary += f"• Categories automatically detected using smart parsing\n"
+            summary += f"• These can be updated later with proper categorization and unit specifications\n"
+            
+            # Show enhanced item examples if any were created with unit size > 1
+            enhanced_items = [r for r in results if r.get("success") and r.get("created")]
+            if enhanced_items:
+                summary += f"\n🔍 <b>Enhanced Items Created:</b>\n"
+                for result in enhanced_items[:3]:  # Show first 3 enhanced items
+                    item_name = result.get("item_name", "Unknown")
+                    quantity = result.get("quantity", 0)
+                    # Try to extract unit info from the name for display
+                    unit_size, unit_type = self._extract_unit_info_from_name(item_name)
+                    # Get detected category for display
+                    detected_category = category_parser.parse_category(item_name)
+                    
+                    if unit_size > 1.0 and unit_type != "piece":
+                        total_volume = unit_size * quantity
+                        summary += f"• {item_name} (Category: {detected_category}): {quantity} units × {unit_size} {unit_type} = {total_volume} {unit_type}\n"
+                    else:
+                        summary += f"• {item_name} (Category: {detected_category}): {quantity} {unit_type}\n"
+                
+                if len(enhanced_items) > 3:
+                    summary += f"... and {len(enhanced_items) - 3} more enhanced items\n"
         
         if batch_id and self.audit_trail_service:
             summary += f"\n📋 <b>Audit Trail:</b> Created for all successful entries (Batch: {batch_id})"

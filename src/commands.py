@@ -3,8 +3,8 @@
 import re
 from typing import List, Optional, Tuple
 
-from .schemas import Command, MovementType
-from .nlp_parser import NLPStockParser
+from schemas import Command, MovementType
+from nlp_parser import NLPStockParser
 
 
 class CommandParser:
@@ -20,6 +20,18 @@ class CommandParser:
             "in": r"^/in\s+([\s\S]+)$",  # Captures everything after /in including newlines
             "out": r"^/out\s+([\s\S]+)$",  # Captures everything after /out including newlines
             "stock": r"^/stock\s+(.+)$",  # Captures everything after /stock for fuzzy search
+            "search_category": r"^/search\s+category:([^\s]+)\s*(.+)?$",  # Category-based search
+            "category_overview": r"^/category\s+overview$",  # Category overview
+            "low_stock_category": r"^/stock\s+low\s+category:([^\s]+)$",  # Low stock by category
+            "migration_preview": r"^/migration\s+preview$",  # Migration preview
+            "migration_validate": r"^/migration\s+validate$",  # Migration validation
+            "migration_dry_run": r"^/migration\s+dry_run$",  # Migration dry run
+            "migration_execute": r"^/migration\s+execute$",  # Execute migration
+            "report_category": r"^/report\s+category:([^\s]+)$",  # Category-based report
+            "report_statistics": r"^/report\s+statistics$",  # Category statistics report
+            "edge_case_test": r"^/edge\s+test$",  # Test edge case handling
+            "performance_test": r"^/performance\s+test$",  # Run performance tests
+            "system_health": r"^/system\s+health$",  # System health check
             "inventory_validate": r"^/inventory\s+validate\s+([\s\S]+)$",  # Must come before inventory
             "inventory": r"^/inventory\s+([\s\S]+)$"  # Captures everything after /inventory including newlines
         }

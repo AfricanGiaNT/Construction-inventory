@@ -3,8 +3,8 @@
 import logging
 from typing import Optional
 
-from .schemas import UserRole
-from .airtable_client import AirtableClient
+from schemas import UserRole
+from airtable_client import AirtableClient
 # Settings will be passed in constructor
 
 logger = logging.getLogger(__name__)
