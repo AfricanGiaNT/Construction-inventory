@@ -385,6 +385,12 @@ class InventoryService:
                     "pieces": "piece"
                 }
                 
+                # Special handling for volume specifications (l, liter, etc.) - these should use 'piece' unit
+                volume_patterns = ["l", "liter", "litre", "litres", "ltr", "ltrs"]
+                if unit_type.lower() in volume_patterns:
+                    logger.info(f"'{unit_type}' detected as volume specification for '{item_name}', using unit 'piece'")
+                    return unit_size, "piece"
+                
                 standardized_unit_type = unit_type_mapping.get(unit_type.lower(), unit_type.lower())
                 
                 logger.info(f"Extracted unit info from '{item_name}': size={unit_size}, type={standardized_unit_type}")

@@ -181,6 +181,12 @@ class AirtableClient:
                     logger.info(f"'{unit_type}' detected as thickness specification for '{item_name}', using unit 'piece'")
                     return 1.0, "piece"
                 
+                # Special handling for volume specifications (l, liter, etc.)
+                volume_patterns = ["l", "liter", "litre", "litres", "ltr", "ltrs"]
+                if unit_type in volume_patterns:
+                    logger.info(f"'{unit_type}' detected as volume specification for '{item_name}', using unit 'piece'")
+                    return unit_size, "piece"
+                
                 standardized_unit_type = unit_type_mapping.get(unit_type, unit_type)
                 
                 logger.info(f"Extracted unit info from '{item_name}': size={unit_size}, type={standardized_unit_type}")
@@ -237,9 +243,7 @@ class AirtableClient:
                 "meter": "meter",
                 "meters": "meter",
                 "kg": "kg",
-                "ton": "ton",
-                "litre": "litre",
-                "litres": "litre"
+                "ton": "ton"
             }
             
             # Map common categories to valid Airtable options (based on existing data)
