@@ -9,6 +9,7 @@ from pyairtable.formulas import match
 
 # Settings will be passed in constructor
 from schemas import Item, StockMovement, TelegramUser, UserRole
+from services.smart_unit_converter import smart_unit_converter
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ class AirtableClient:
                 name=record["fields"].get("Name", ""),
                 sku=record["fields"].get("Name", ""),  # Use name as SKU for now
                 description=None,  # Aliases field removed
-                base_unit=record["fields"].get("Base Unit", ""),
+                # base_unit and unit_type fields removed from Airtable
                 units=[],  # Simplified - no Item Units table
                 on_hand=record["fields"].get("On Hand", 0.0),
                 threshold=record["fields"].get("Reorder Level"),  # Using Reorder Level as threshold
@@ -55,9 +56,9 @@ class AirtableClient:
                 is_active=record["fields"].get("Is Active", True),
                 last_stocktake_date=record["fields"].get("Last Stocktake Date"),
                 last_stocktake_by=record["fields"].get("Last Stocktake By"),
-                # New fields for enhanced item structure
+                # Enhanced item structure - only unit_size remains in Airtable
                 unit_size=record["fields"].get("Unit Size", 1.0),
-                unit_type=record["fields"].get("Unit Type", "piece")
+                unit_type="piece"  # Default for internal use only
             )
         except Exception as e:
             logger.error(f"Error getting item {item_name}: {e}")
@@ -80,16 +81,16 @@ class AirtableClient:
                         name=fields.get("Name", ""),
                         sku=fields.get("Name", ""),  # Use name as SKU
                         description=None,  # Aliases field removed
-                        base_unit=fields.get("Base Unit", ""),
+                        # base_unit and unit_type fields removed from Airtable
                         units=[],
                         on_hand=fields.get("On Hand", 0.0),
                         threshold=fields.get("Reorder Level"),
                         location=fields.get("Preferred Location", [None])[0] if fields.get("Preferred Location") else None,
                         category=fields.get("Category", ""),
                         large_qty_threshold=fields.get("Large Qty Threshold"),
-                        # New fields for enhanced item structure
+                        # Enhanced item structure - only unit_size remains in Airtable
                         unit_size=fields.get("Unit Size", 1.0),
-                        unit_type=fields.get("Unit Type", "piece")
+                        unit_type="piece"  # Default for internal use only
                     ))
             
             return results[:10]  # Limit results
@@ -109,16 +110,16 @@ class AirtableClient:
                     name=fields.get("Name", ""),
                     sku=fields.get("Name", ""),  # Use name as SKU
                     description=None,  # Aliases field removed
-                    base_unit=fields.get("Base Unit", ""),
+                    # base_unit and unit_type fields removed from Airtable
                     units=[],
                     on_hand=fields.get("On Hand", 0.0),
                     threshold=fields.get("Reorder Level"),
                     location=fields.get("Preferred Location", [None])[0] if fields.get("Preferred Location") else None,
                     category=fields.get("Category", ""),
                     large_qty_threshold=fields.get("Large Qty Threshold"),
-                    # New fields for enhanced item structure
+                    # Enhanced item structure - only unit_size remains in Airtable
                     unit_size=fields.get("Unit Size", 1.0),
-                    unit_type=fields.get("Unit Type", "piece")
+                    unit_type="piece"  # Default for internal use only
                 )
                 items.append(item)
             
@@ -131,72 +132,33 @@ class AirtableClient:
     
     def _extract_unit_info_from_name(self, item_name: str) -> tuple[float, str]:
         """
-        Extract unit size and type from item name if specified.
+        Extract unit size and type from item name using smart conversion.
+        
+        This method now uses the SmartUnitConverter to extract unit specifications
+        for tracking purposes (no base unit field needed).
         
         Examples:
-        - "Paint 20ltrs" -> (20.0, "ltrs")
-        - "Cement 50kg" -> (50.0, "kg")
-        - "Steel Beam" -> (1.0, "piece")
+        - "Paint 20ltrs" -> (20.0, "l")       # Volume spec
+        - "Cement 50kg" -> (50.0, "kg")       # Weight spec
+        - "Steel Beam 6m" -> (6.0, "m")       # Length spec
+        - "Cable 1.5sqm" -> (1.5, "sqm")      # Area spec
         
         Returns:
-            Tuple of (unit_size, unit_type)
+            Tuple of (unit_size, detected_unit_type)
         """
         try:
-            # Pattern to match: ItemName NumberUnit (e.g., "Paint 20ltrs", "Cement 50kg")
-            import re
-            pattern = r'(.+?)\s+(\d+(?:\.\d+)?)([a-zA-Z]+)$'
-            match = re.match(pattern, item_name.strip())
+            # Use smart converter for intelligent extraction
+            conversion_result = smart_unit_converter.convert_item_specification(item_name)
             
-            if match:
-                base_name = match.group(1).strip()
-                unit_size = float(match.group(2))
-                unit_type = match.group(3).lower()
-                
-                # Validate unit_size
-                if unit_size <= 0:
-                    logger.warning(f"Invalid unit_size {unit_size} extracted from {item_name}, defaulting to 1.0")
-                    return 1.0, "piece"
-                
-                # Map common unit types to standardized values
-                unit_type_mapping = {
-                    "ltrs": "ltrs",
-                    "litres": "ltrs",
-                    "ltr": "ltrs",
-                    "kg": "kg",
-                    "kgs": "kg",
-                    "ton": "ton",
-                    "tons": "ton",
-                    "m": "m",
-                    "meter": "m",
-                    "meters": "m",
-                    "bag": "bag",
-                    "bags": "bag",
-                    "piece": "piece",
-                    "pieces": "piece"
-                }
-                
-                # Special handling for thickness specifications (mm, cm, etc.)
-                thickness_patterns = ["mm", "cm", "inch", "inches"]
-                if unit_type in thickness_patterns:
-                    logger.info(f"'{unit_type}' detected as thickness specification for '{item_name}', using unit 'piece'")
-                    return 1.0, "piece"
-                
-                # Special handling for volume specifications (l, liter, etc.)
-                volume_patterns = ["l", "liter", "litre", "litres", "ltr", "ltrs"]
-                if unit_type in volume_patterns:
-                    logger.info(f"'{unit_type}' detected as volume specification for '{item_name}', using unit 'piece'")
-                    return unit_size, "piece"
-                
-                standardized_unit_type = unit_type_mapping.get(unit_type, unit_type)
-                
-                logger.info(f"Extracted unit info from '{item_name}': size={unit_size}, type={standardized_unit_type}")
-                return unit_size, standardized_unit_type
+            logger.info(f"Smart conversion in AirtableClient: {conversion_result.original_input} → "
+                       f"size={conversion_result.detected_unit_size}, "
+                       f"type={conversion_result.detected_unit_type}, "
+                       f"confidence={conversion_result.confidence:.2f}")
             
-            # No unit info found, return defaults
-            return 1.0, "piece"
+            return conversion_result.detected_unit_size, conversion_result.detected_unit_type
             
         except Exception as e:
-            logger.warning(f"Error extracting unit info from '{item_name}': {e}, using defaults")
+            logger.warning(f"Error in smart unit extraction for '{item_name}': {e}, using defaults")
             return 1.0, "piece"
 
     async def test_connection(self) -> bool:
@@ -209,7 +171,7 @@ class AirtableClient:
             logger.error(f"Airtable connection test failed: {e}")
             return False
     
-    async def create_item_if_not_exists(self, item_name: str, base_unit: str = "piece", category: str = "General", 
+    async def create_item_if_not_exists(self, item_name: str, category: str = "General", 
                                       unit_size: float = 1.0, unit_type: str = "piece") -> Optional[str]:
         """Create a new item if it doesn't exist."""
         try:
@@ -228,84 +190,22 @@ class AirtableClient:
                 logger.warning(f"Empty unit_type for {item_name}, defaulting to 'piece'")
                 unit_type = "piece"
             
-            # Handle thickness specifications (mm, cm, etc.) - these should use 'piece' unit
-            thickness_patterns = ["mm", "cm", "inch", "inches"]
-            if unit_type in thickness_patterns:
-                logger.info(f"'{unit_type}' detected as thickness specification for '{item_name}', using unit 'piece'")
-                unit_type = "piece"
+            # Base unit field has been removed from Airtable - no longer needed
             
-            # Map common units to valid Airtable options (based on existing data)
-            unit_mapping = {
-                "piece": "piece",
-                "pieces": "piece", 
-                "bag": "bag",
-                "bags": "bag",
-                "meter": "meter",
-                "meters": "meter",
-                "kg": "kg",
-                "ton": "ton"
-            }
-            
-            # Map common categories to valid Airtable options (based on existing data)
-            # Use only categories that are confirmed to exist in Airtable
-            # Note: Airtable categories are case-sensitive, so we map to exact values
-            category_mapping = {
-                "general": "General",  # Default to General category
-                "steel": "Steel",
-                "electrical": "Electrical", 
-                "paint": "Paint",  # Map paint to existing Paint category
-                "white": "Paint",  # Map white to Paint category
-                "bitumec": "Paint",  # Map bitumec to Paint category
-                "litres": "Paint",  # Map litres to Paint category
-                "wire": "Electrical",  # Map wire to Electrical category
-                "cable": "Electrical",  # Map cable to Electrical category
-                "beam": "Steel",  # Map beam to Steel category
-                "plate": "Steel",  # Map plate to Steel category
-                "angle": "Steel",  # Map angle to Steel category
-                "cement": "General",  # Map cement to General (since Cement doesn't exist)
-                "concrete": "General",  # Map concrete to General
-                "plumbing": "General",  # Map plumbing to General
-                "safety": "General",  # Map safety to General
-                "tools": "General",  # Map tools to General
-                "equipment": "General"  # Map equipment to General
-            }
-            
-            # Use mapped unit or default to existing valid option
-            valid_unit = unit_mapping.get(base_unit.lower(), "meter")  # Default to existing option
-            
-            # Use mapped category or try to auto-detect from item name
-            # This ensures we only use categories that exist in Airtable
-            valid_category = None
-            
-            if category:
-                # Handle case-insensitive matching for common categories
-                category_lower = category.lower()
-                valid_category = category_mapping.get(category_lower, None)
-            
-            # If no category mapping found, try to auto-detect from item name
-            if not valid_category:
-                item_lower = item_name.lower()
-                if any(paint_word in item_lower for paint_word in ['paint', 'white', 'bitumec', 'ltrs', 'litres']):
-                    valid_category = "Paint"
-                elif any(electrical_word in item_lower for electrical_word in ['wire', 'cable', 'electrical', 'electric']):
-                    valid_category = "Electrical"
-                elif any(steel_word in item_lower for steel_word in ['steel', 'beam', 'plate', 'angle']):
-                    valid_category = "Steel"
-                else:
-                    valid_category = "General"  # Default to General for everything else
+            # Use smart converter for intelligent category mapping
+            conversion_result = smart_unit_converter.convert_item_specification(item_name, category)
+            valid_category = conversion_result.mapped_category
             
             # Log the mapping for debugging
             if category:
-                logger.info(f"Category mapping: '{category}' (lowercase: '{category.lower()}') → '{valid_category}'")
+                logger.info(f"Smart category mapping: '{category}' → '{valid_category}' (confidence: {conversion_result.confidence:.2f})")
             else:
-                logger.info(f"Auto-detected category from item name '{item_name}' → '{valid_category}'")
+                logger.info(f"Smart category detection: '{item_name}' → '{valid_category}' (confidence: {conversion_result.confidence:.2f})")
             
-            # Create new item with enhanced fields
+            # Create new item with enhanced fields (no Base Unit or Unit Type fields)
             record = {
                 "Name": item_name,
-                "Base Unit": valid_unit,
                 "Unit Size": unit_size,
-                "Unit Type": unit_type,
                 "Category": valid_category,
                 "On Hand": 0.0,
                 "Reorder Level": 10,  # Default threshold
@@ -313,7 +213,7 @@ class AirtableClient:
                 "Is Active": True
             }
             
-            logger.info(f"Creating new item: {item_name} with unit: {valid_unit}, unit_size: {unit_size}, unit_type: {unit_type}")
+            logger.info(f"Creating new item: {item_name} with unit_size: {unit_size} (unit_type: {unit_type} for internal tracking only)")
             created = self.items_table.create(record)
             logger.info(f"Created new item: {item_name}")
             return created["id"]

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from schemas import Item
 from services.category_parser import category_parser
+from services.smart_unit_converter import smart_unit_converter
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ class InventoryParser:
                 entries=[],
                 total_lines=len(lines),
                 valid_entries=0,
-                errors=["Invalid header format. Expected: date:DD/MM/YY logged by: NAME1,NAME2"],
+                errors=["Invalid header format. Expected: logged by: NAME1,NAME2 [date:DD/MM/YY] [category: CATEGORY]"],
                 is_valid=False
             )
 
@@ -114,14 +115,19 @@ class InventoryParser:
 
     def _parse_header(self, header_line: str) -> Optional[InventoryHeader]:
         """Parse the header line for date, logged by, and optional category information."""
-        # Pattern: date:DD/MM/YY logged by: NAME1,NAME2 [category: CATEGORY]
+        # Pattern: [date:DD/MM/YY] logged by: NAME1,NAME2 [category: CATEGORY]
+        # Date is now optional - if not provided, defaults to current date
         # Allow flexible whitespace and variations, category can be anywhere
-        # First, extract the date
-        date_match = re.search(r'date:\s*(\d{1,2}/\d{1,2}/\d{2})', header_line, re.IGNORECASE)
-        if not date_match:
-            return None
         
-        date_str = date_match.group(1)
+        # Extract the date (optional)
+        date_match = re.search(r'date:\s*(\d{1,2}/\d{1,2}/\d{2})', header_line, re.IGNORECASE)
+        if date_match:
+            date_str = date_match.group(1)
+        else:
+            # Default to current date in DD/MM/YY format
+            from datetime import datetime
+            current_date = datetime.now()
+            date_str = current_date.strftime("%d/%m/%y")
         
         # Extract logged by
         logged_by_match = re.search(r'(?:logged\s+by|logged_by):\s*(.+?)(?=\s+category:|$)', header_line, re.IGNORECASE)
@@ -206,15 +212,19 @@ class InventoryParser:
             if entry_result:
                 item_name = entry_result.item_name.lower()  # Use lowercase for deduplication
 
-                # If we've seen this item before, remove the previous entry
+                # If we've seen this item before, combine the quantities
                 if item_name in seen_items:
-                    entries = [e for e in entries if e.item_name.lower() != item_name]
-                    item_count -= 1
-
-                # Add the new entry
-                entries.append(entry_result)
-                seen_items[item_name] = True
-                item_count += 1
+                    # Find the existing entry and add the quantities
+                    for existing_entry in entries:
+                        if existing_entry.item_name.lower() == item_name:
+                            existing_entry.quantity += entry_result.quantity
+                            logger.info(f"Combined quantities for {entry_result.item_name}: {existing_entry.quantity - entry_result.quantity} + {entry_result.quantity} = {existing_entry.quantity}")
+                            break
+                else:
+                    # Add the new entry
+                    entries.append(entry_result)
+                    seen_items[item_name] = True
+                    item_count += 1
             else:
                 errors.append(f"Line {line_num}: Invalid format. Expected: Item Name, Quantity")
                 skipped_lines += 1
@@ -313,10 +323,10 @@ class InventoryParser:
             if not header_line.startswith('/inventory'):
                 header_line = '/inventory ' + header_line
             
-            # Check if header has the right format
-            if 'date:' not in header_line.lower() or 'logged' not in header_line.lower():
+            # Check if header has the right format (logged by is required, date is optional)
+            if 'logged' not in header_line.lower():
                 # Provide a complete template
-                return "/inventory date:25/01/25 logged by: YourName\nItem Name, Quantity\nItem Name, Quantity"
+                return "/inventory logged by: YourName\nItem Name, Quantity\nItem Name, Quantity"
             
             # If header looks good, just show the format for entries
             return f"{header_line}\nItem Name, Quantity\nItem Name, Quantity"
@@ -338,69 +348,36 @@ class InventoryService:
 
     def _extract_unit_info_from_name(self, item_name: str) -> Tuple[float, str]:
         """
-        Extract unit size and type from item name if specified.
+        Extract unit size and type from item name using smart conversion.
+        
+        This method now uses the SmartUnitConverter to extract unit specifications
+        for tracking purposes (no base unit field needed).
         
         Examples:
-        - "20 ltrs white shene" -> (20.0, "ltrs")
-        - "5 litres red oxide" -> (5.0, "litres")
-        - "Cement 50kg" -> (50.0, "kg")
-        - "Steel Beam" -> (1.0, "piece")
+        - "20l pva plascon plaster primer" -> (20.0, "l")      # Volume spec
+        - "Green cable 1.5sqm 100meters" -> (1.5, "sqm")      # Area spec  
+        - "Cement 50kg" -> (50.0, "kg")                        # Weight spec
+        - "Steel Beam 6m" -> (6.0, "m")                        # Length spec
         
         Returns:
-            Tuple of (unit_size, unit_type)
+            Tuple of (unit_size, detected_unit_type)
         """
         try:
-            import re
+            # Use smart converter for intelligent extraction
+            conversion_result = smart_unit_converter.convert_item_specification(item_name)
             
-            # First, try to match unit info anywhere in the item name (not just at the end)
-            # Pattern: Number + Unit (e.g., "20 ltrs", "5 litres", "50kg")
-            unit_pattern = r'(\d+(?:\.\d+)?)\s*([a-zA-Z]+)'
-            unit_matches = re.findall(unit_pattern, item_name)
+            logger.info(f"Smart conversion result: {conversion_result.original_input} → "
+                       f"size={conversion_result.detected_unit_size}, "
+                       f"type={conversion_result.detected_unit_type}, "
+                       f"confidence={conversion_result.confidence:.2f}")
             
-            if unit_matches:
-                # Use the first unit match found
-                unit_size_str, unit_type = unit_matches[0]
-                unit_size = float(unit_size_str)
-                
-                # Validate unit_size
-                if unit_size <= 0:
-                    logger.warning(f"Invalid unit_size {unit_size} extracted from {item_name}, defaulting to 1.0")
-                    return 1.0, "piece"
-                
-                # Map common unit types to standardized values
-                unit_type_mapping = {
-                    "ltrs": "litre",
-                    "litres": "litre",
-                    "ltr": "litre",
-                    "kg": "kg",
-                    "kgs": "kg",
-                    "ton": "ton",
-                    "tons": "ton",
-                    "m": "m",
-                    "meter": "m",
-                    "meters": "m",
-                    "bag": "bag",
-                    "bags": "bag",
-                    "piece": "piece",
-                    "pieces": "piece"
-                }
-                
-                # Special handling for volume specifications (l, liter, etc.) - these should use 'piece' unit
-                volume_patterns = ["l", "liter", "litre", "litres", "ltr", "ltrs"]
-                if unit_type.lower() in volume_patterns:
-                    logger.info(f"'{unit_type}' detected as volume specification for '{item_name}', using unit 'piece'")
-                    return unit_size, "piece"
-                
-                standardized_unit_type = unit_type_mapping.get(unit_type.lower(), unit_type.lower())
-                
-                logger.info(f"Extracted unit info from '{item_name}': size={unit_size}, type={standardized_unit_type}")
-                return unit_size, standardized_unit_type
+            if conversion_result.confidence < 0.5:
+                logger.warning(f"Low confidence ({conversion_result.confidence:.2f}) for conversion: {conversion_result.notes}")
             
-            # No unit info found, return defaults
-            return 1.0, "piece"
+            return conversion_result.detected_unit_size, conversion_result.detected_unit_type
             
         except Exception as e:
-            logger.warning(f"Error extracting unit info from '{item_name}': {e}, using defaults")
+            logger.warning(f"Error in smart unit extraction for '{item_name}': {e}, using defaults")
             return 1.0, "piece"
 
     async def process_inventory_stocktake(self, command_text: str, user_id: int, user_name: str, 
@@ -435,11 +412,12 @@ class InventoryService:
                         error_message += f"• {parse_result.comment_lines} comment lines ignored\n"
                 
                 error_message += "\n<b>Expected Format:</b>\n"
-                error_message += "/inventory date:DD/MM/YY logged by: NAME1,NAME2 [category: CATEGORY]\n"
+                error_message += "/inventory logged by: NAME1,NAME2 [date:DD/MM/YY] [category: CATEGORY]\n"
                 error_message += "Item Name, Quantity\n"
                 error_message += "Item Name, Quantity\n"
                 error_message += "\n💡 <b>Tips:</b>\n"
                 error_message += "• Use 'logged by:' or 'logged_by:' (both work)\n"
+                error_message += "• Date is optional - defaults to today if not provided\n"
                 error_message += "• Use 'category: CATEGORY' to override auto-detection\n"
                 error_message += "• Comment lines starting with # are ignored\n"
                 error_message += "• Blank lines are ignored\n"
@@ -531,12 +509,9 @@ class InventoryService:
         
         report += "\n📋 <b>Parsed Entries:</b>\n"
         for entry in parse_result.entries:
-            if parse_result.header.category:
-                # Use category override
-                detected_category = parse_result.header.category
-            else:
-                # Auto-detect category
-                detected_category = category_parser.parse_category(entry.item_name)
+            # Use smart converter for category detection
+            conversion_result = smart_unit_converter.convert_item_specification(entry.item_name, parse_result.header.category)
+            detected_category = conversion_result.mapped_category
             report += f"• {entry.item_name} → {detected_category}: {entry.quantity}\n"
         
         report += f"\n💡 <b>Ready to apply!</b> Use the same command without 'validate' to process."
@@ -603,13 +578,15 @@ class InventoryService:
                 # Update existing item
                 success = await self._update_item_stock(entry.item_name, entry.quantity, existing_item, normalized_date, user_name)
                 if success:
+                    new_total = previous_quantity + entry.quantity
                     return {
                         "success": True,
                         "created": False,
                         "item_name": entry.item_name,
                         "quantity": entry.quantity,
                         "previous_quantity": previous_quantity,
-                        "message": f"Updated {entry.item_name} stock to {entry.quantity}"
+                        "new_total": new_total,
+                        "message": f"Added {entry.quantity} to {entry.item_name} stock (was {previous_quantity}, now {new_total})"
                     }
                 else:
                     return {
@@ -618,7 +595,7 @@ class InventoryService:
                         "item_name": entry.item_name,
                         "quantity": entry.quantity,
                         "previous_quantity": previous_quantity,
-                        "message": f"Failed to update {entry.item_name} stock"
+                        "message": f"Failed to add {entry.quantity} to {entry.item_name} stock"
                     }
             else:
                 # Create new item with enhanced defaults
@@ -626,25 +603,16 @@ class InventoryService:
                     # Extract unit size and type from item name if specified (e.g., "Paint 20ltrs")
                     unit_size, unit_type = self._extract_unit_info_from_name(entry.item_name)
                     
-                    # Use category override if provided, otherwise auto-detect
-                    if category_override:
-                        detected_category = category_override
-                    else:
-                        detected_category = category_parser.parse_category(entry.item_name)
+                    # Use smart converter for both unit and category detection
+                    conversion_result = smart_unit_converter.convert_item_specification(entry.item_name, category_override)
                     
-                    # Determine base unit from item name or use detected unit type
-                    # For paint items, use the extracted unit type (e.g., "litre" instead of "piece")
-                    if unit_type and unit_type != "piece":
-                        base_unit = unit_type
-                    else:
-                        # Fallback to piece for items without specific units
-                        base_unit = "piece"
+                    # Use category override if provided, otherwise use smart detection
+                    detected_category = conversion_result.mapped_category
                     
-                    logger.info(f"Determined base unit for {entry.item_name}: {base_unit} (from unit_type: {unit_type})")
+                    logger.info(f"Creating item {entry.item_name} with category: {detected_category}, unit_size: {unit_size}, unit_type: {unit_type}")
                     
                     new_item_id = await self.airtable.create_item_if_not_exists(
                         item_name=entry.item_name,
-                        base_unit=base_unit,  # Dynamic based on item name
                         category=detected_category,  # Use override or auto-detected category
                         unit_size=unit_size,
                         unit_type=unit_type
@@ -702,9 +670,9 @@ class InventoryService:
                 "message": f"Error: {str(e)}"
             }
 
-    async def _update_item_stock(self, item_name: str, new_quantity: float, existing_item: Optional[Item] = None,
+    async def _update_item_stock(self, item_name: str, quantity_to_add: float, existing_item: Optional[Item] = None,
                                 normalized_date: str = "", user_name: str = "") -> bool:
-        """Update item stock to a specific quantity (not increment/decrement)."""
+        """Add quantity to existing item stock (cumulative updates)."""
         try:
             # Use existing item if provided, otherwise get it
             if existing_item is None:
@@ -714,8 +682,8 @@ class InventoryService:
             else:
                 item = existing_item
 
-            # Calculate the change needed
-            quantity_change = new_quantity - item.on_hand
+            # Add the new quantity to existing stock (cumulative behavior)
+            quantity_change = quantity_to_add
 
             # Use the existing update method
             success = await self.airtable.update_item_stock(item_name, quantity_change)
@@ -760,7 +728,7 @@ class InventoryService:
             summary += f"<b>Batch ID:</b> {batch_id}\n"
         
         summary += f"\n✅ <b>Results:</b>\n"
-        summary += f"• Items updated: {updated_items}\n"
+        summary += f"• Items updated (quantities added): {updated_items}\n"
         summary += f"• Items created: {created_items}\n"
         summary += f"• Items failed: {failed_items}\n"
         
@@ -773,6 +741,21 @@ class InventoryService:
                 summary += f"• {parse_result.comment_lines} comment lines ignored\n"
             if parse_result.skipped_lines > 0:
                 summary += f"• {parse_result.skipped_lines} invalid lines skipped\n"
+
+        # Show cumulative updates for existing items
+        if updated_items > 0:
+            updated_results = [r for r in results if r.get("success") and not r.get("created")]
+            if updated_results:
+                summary += f"\n📈 <b>Stock Updates (Cumulative):</b>\n"
+                for result in updated_results[:5]:  # Show first 5 updates
+                    item_name = result.get("item_name", "Unknown")
+                    quantity_added = result.get("quantity", 0)
+                    previous_qty = result.get("previous_quantity", 0)
+                    new_total = result.get("new_total", previous_qty + quantity_added)
+                    summary += f"• {item_name}: +{quantity_added} (was {previous_qty}, now {new_total})\n"
+                
+                if len(updated_results) > 5:
+                    summary += f"• ... and {len(updated_results) - 5} more items\n"
 
         if failed_items > 0:
             summary += f"\n❌ <b>Failed Items:</b>\n"
@@ -795,10 +778,10 @@ class InventoryService:
                 for result in enhanced_items[:3]:  # Show first 3 enhanced items
                     item_name = result.get("item_name", "Unknown")
                     quantity = result.get("quantity", 0)
-                    # Try to extract unit info from the name for display
-                    unit_size, unit_type = self._extract_unit_info_from_name(item_name)
-                    # Get detected category for display
-                    detected_category = category_parser.parse_category(item_name)
+                    # Use smart converter for both unit and category info for display
+                    conversion_result = smart_unit_converter.convert_item_specification(item_name)
+                    unit_size, unit_type = conversion_result.detected_unit_size, conversion_result.detected_unit_type
+                    detected_category = conversion_result.mapped_category
                     
                     if unit_size > 1.0 and unit_type != "piece":
                         total_volume = unit_size * quantity

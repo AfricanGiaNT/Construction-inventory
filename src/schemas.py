@@ -59,7 +59,7 @@ class Item(BaseModel):
     name: str = Field(..., description="Item name")
     sku: Optional[str] = None  # Optional SKU for future use
     description: Optional[str] = None  # Aliases field
-    base_unit: str  # Base unit of measurement (e.g., "ltrs", "kg", "m")
+    # base_unit field has been removed from Airtable
     unit_size: float = Field(default=1.0, gt=0, description="Size of each unit (e.g., 20 for 20ltr cans)")
     unit_type: str = Field(default="piece", description="Type of unit (e.g., 'ltrs', 'kg', 'm', 'piece')")
     total_volume: Optional[float] = Field(default=None, description="Auto-calculated total volume (unit_size × quantity)")
