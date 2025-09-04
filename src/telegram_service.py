@@ -472,12 +472,13 @@ class TelegramService:
             text += "💡 <b>QUICK EXAMPLES</b>\n"
             text += "• <code>/in project: Bridge, cement, 50 bags</code>\n"
             text += "• <code>/stock cement</code>\n"
-            text += "• <code>/help stock</code> - Search help for stock commands\n\n"
+            text += "• <code>/help /in</code> - Detailed help for /in command\n\n"
             
             # Pro tip
-            text += "💡 <b>PRO TIP</b>\n"
-            text += "Use <b>/help [topic]</b> to search for specific commands.\n"
-            text += "Example: <code>/help batch</code> shows batch-related commands."
+            text += "💡 <b>PRO TIPS</b>\n"
+            text += "• <b>/help [topic]</b> - Search by topic (e.g., <code>/help batch</code>)\n"
+            text += "• <b>/help /[command]</b> - Detailed help for specific command\n"
+            text += "• Examples: <code>/help /stock</code>, <code>/help /validate</code>"
             
             return await self.send_message(chat_id, text)
             
@@ -491,6 +492,17 @@ class TelegramService:
             # Import the command suggestions service to get dynamic command data
             from services.command_suggestions import CommandSuggestionsService
             cmd_service = CommandSuggestionsService()
+            
+            # Check if user is asking for help with a specific command (e.g., "/help /in" or "/help in")
+            if search_term.startswith('/'):
+                command_name = search_term[1:]  # Remove the leading slash
+            else:
+                command_name = search_term
+            
+            # Try to get specific command info
+            command_info = cmd_service.get_command_info(command_name)
+            if command_info:
+                return await self._send_command_specific_help(chat_id, command_name, command_info, user_role)
             
             # Get commands by category
             categories = {}
@@ -517,11 +529,15 @@ class TelegramService:
             if not matching_categories:
                 # No matches found
                 text = header_text + f"❌ No commands found matching \"{search_term}\"\n\n"
-                text += "💡 <b>Try these search terms:</b>\n"
+                text += "💡 <b>Try these options:</b>\n"
                 text += "• <code>/help stock</code> - Stock operations\n"
                 text += "• <code>/help query</code> - Search commands\n"
                 text += "• <code>/help batch</code> - Batch operations\n"
                 text += "• <code>/help management</code> - Admin tools\n\n"
+                text += "📝 <b>For specific commands:</b>\n"
+                text += "• <code>/help /in</code> - Detailed help for /in\n"
+                text += "• <code>/help /stock</code> - Detailed help for /stock\n"
+                text += "• <code>/help /validate</code> - Detailed help for /validate\n\n"
                 text += "Or use <code>/help</code> to see all commands."
                 return await self.send_message(chat_id, text)
             
@@ -542,6 +558,69 @@ class TelegramService:
             
         except Exception as e:
             logger.error(f"Error sending filtered help message: {e}")
+            return False
+    
+    async def _send_command_specific_help(self, chat_id: int, command_name: str, command_info: dict, user_role: str) -> bool:
+        """Send detailed help for a specific command."""
+        try:
+            # Build command-specific help message
+            text = f"🤖 <b>COMMAND HELP: /{command_name.upper()}</b>\n\n"
+            
+            # Add category and description
+            category_icon = "📦" if command_info["category"] == "Stock Operations" else \
+                           "🔍" if command_info["category"] == "Queries" else \
+                           "⚙️" if command_info["category"] == "Management" else \
+                           "📋" if command_info["category"] == "Batch Operations" else "❓"
+            
+            text += f"<b>Category:</b> {category_icon} {command_info['category']}\n"
+            text += f"<b>Description:</b> {command_info['description']}\n\n"
+            
+            # Add usage
+            text += f"📝 <b>USAGE</b>\n"
+            text += f"<code>{command_info['usage']}</code>\n\n"
+            
+            # Add examples
+            if 'examples' in command_info and command_info['examples']:
+                text += f"💡 <b>EXAMPLES</b>\n"
+                for example in command_info['examples']:
+                    text += f"• <code>{example}</code>\n"
+                text += "\n"
+            
+            # Add role-specific notes
+            if command_info["category"] == "Management" and user_role not in ["admin", "staff"]:
+                text += f"⚠️ <b>NOTE:</b> This command requires Admin or Staff role\n"
+                text += f"Your current role: {user_role.title()}\n\n"
+            elif command_name in ["adjust", "inventory", "inventory_validate"] and user_role != "admin":
+                text += f"⚠️ <b>NOTE:</b> This command requires Admin role\n"
+                text += f"Your current role: {user_role.title()}\n\n"
+            
+            # Add tips for specific commands
+            if command_name in ["in", "out", "adjust"]:
+                text += f"💡 <b>TIPS</b>\n"
+                text += f"• Always include <b>project:</b> in your commands\n"
+                text += f"• Use commas to separate item, quantity, and details\n"
+                text += f"• Batch operations: separate entries with semicolons or newlines\n\n"
+            elif command_name == "stock":
+                text += f"💡 <b>TIPS</b>\n"
+                text += f"• Uses fuzzy search - partial matches work\n"
+                text += f"• Shows detailed item information and stock levels\n"
+                text += f"• Try variations if exact name doesn't work\n\n"
+            elif command_name == "validate":
+                text += f"💡 <b>TIPS</b>\n"
+                text += f"• Test your batch format before processing\n"
+                text += f"• Use semicolons or newlines to separate entries\n"
+                text += f"• Include global parameters like project: at the start\n\n"
+            
+            # Add footer
+            text += f"❓ <b>Need more help?</b>\n"
+            text += f"• <code>/help</code> - See all commands\n"
+            text += f"• <code>/batchhelp</code> - Detailed batch guide\n"
+            text += f"• <code>/help [topic]</code> - Search by topic"
+            
+            return await self.send_message(chat_id, text)
+            
+        except Exception as e:
+            logger.error(f"Error sending command-specific help for '{command_name}': {e}")
             return False
     
     async def send_error_message(self, chat_id: int, error_message: str) -> bool:
