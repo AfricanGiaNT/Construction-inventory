@@ -636,7 +636,7 @@ class AirtableClient:
                 return []
             
             # Get movements from the Stock Movements table
-            formula = match({"Item Name": item_name})
+            formula = match({"Name": item_name})
             records = self.movements_table.all(formula=formula, max_records=limit)
             
             movements = []

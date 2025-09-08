@@ -225,18 +225,18 @@ class TelegramService:
                 text += f"<b>Stock Level:</b> {item.on_hand} units × {item.unit_size} {item.unit_type} = {total_volume} {item.unit_type}\n"
                 text += f"<b>Unit Size:</b> {item.unit_size} {item.unit_type}\n"
                 text += f"<b>Unit Type:</b> {item.unit_type}\n"
-                text += f"<b>Base Unit:</b> {item.base_unit}\n"
+                text += f"<b>Base Unit:</b> {item.unit_type}\n"
             else:
                 # Standard display for regular items
-                text += f"<b>Stock Level:</b> {item.on_hand} {item.base_unit}\n"
-                text += f"<b>Unit Size:</b> 1 {item.base_unit}\n"
+                text += f"<b>Stock Level:</b> {item.on_hand} {item.unit_type}\n"
+                text += f"<b>Unit Size:</b> 1 {item.unit_type}\n"
             
             if item.threshold:
                 if item.unit_size > 1.0 and item.unit_type != "piece":
                     threshold_volume = item.threshold * item.unit_size
                     text += f"<b>Reorder Threshold:</b> {item.threshold} units ({threshold_volume} {item.unit_type})\n"
                 else:
-                    text += f"<b>Reorder Threshold:</b> {item.threshold} {item.base_unit}\n"
+                    text += f"<b>Reorder Threshold:</b> {item.threshold} {item.unit_type}\n"
             
             if item.location:
                 text += f"<b>Preferred Location:</b> {item.location}\n"
@@ -249,7 +249,7 @@ class TelegramService:
                     large_qty_volume = item.large_qty_threshold * item.unit_size
                     text += f"<b>Large Qty Threshold:</b> {item.large_qty_threshold} units ({large_qty_volume} {item.unit_type})\n"
                 else:
-                    text += f"<b>Large Qty Threshold:</b> {item.large_qty_threshold} {item.base_unit}\n"
+                    text += f"<b>Large Qty Threshold:</b> {item.large_qty_threshold} {item.unit_type}\n"
             
             # Pending information
             if pending_movements:
