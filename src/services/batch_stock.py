@@ -12,6 +12,7 @@ from schemas import (
 )
 from airtable_client import AirtableClient
 from services.stock import StockService
+from services.duplicate_detection import DuplicateDetectionService, MovementDuplicateDetectionResult, MovementDuplicateResult
 from utils.error_handling import ErrorHandler
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ class BatchStockService:
         self.airtable = airtable_client
         self.settings = settings
         self.stock_service = stock_service
+        self.duplicate_detection_service = DuplicateDetectionService(airtable_client)
         
         # Track created movement IDs for potential rollback
         self.created_movements = []
@@ -451,3 +453,36 @@ class BatchStockService:
                 message += f"\n\n⚠️ Failed items:\n" + "\n".join(failed_items)
             
             return message
+    
+    async def check_movement_duplicates(self, movements: List[StockMovement]) -> MovementDuplicateDetectionResult:
+        """
+        Check for potential duplicates in a list of movements.
+        Args:
+            movements: List of movements to check for duplicates
+        Returns:
+            MovementDuplicateDetectionResult with duplicate information
+        """
+        try:
+            logger.info(f"Checking for duplicates in {len(movements)} movements")
+            movement_duplicates = await self.duplicate_detection_service.find_potential_duplicates_for_movements(movements)
+            has_any_duplicates = any(result.has_duplicates for result in movement_duplicates.values())
+            total_duplicates = sum(len(result.potential_duplicates) for result in movement_duplicates.values())
+            requires_stock_check = any(result.stock_check_results for result in movement_duplicates.values())
+            result = MovementDuplicateDetectionResult(
+                movement_results=list(movement_duplicates.values()),
+                has_any_duplicates=has_any_duplicates,
+                total_movements=len(movements),
+                total_duplicates=total_duplicates,
+                requires_stock_check=requires_stock_check
+            )
+            logger.info(f"Duplicate check completed: {total_duplicates} potential duplicates found")
+            return result
+        except Exception as e:
+            logger.error(f"Error checking movement duplicates: {e}")
+            return MovementDuplicateDetectionResult(
+                movement_results=[],
+                has_any_duplicates=False,
+                total_movements=len(movements),
+                total_duplicates=0,
+                requires_stock_check=False
+            )

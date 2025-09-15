@@ -8,7 +8,7 @@ from pyairtable import Api, Base, Table
 from pyairtable.formulas import match
 
 # Settings will be passed in constructor
-from schemas import Item, StockMovement, TelegramUser, UserRole
+from schemas import Item, StockMovement, TelegramUser, UserRole, MovementType
 from services.smart_unit_converter import smart_unit_converter
 
 logger = logging.getLogger(__name__)
@@ -263,7 +263,7 @@ class AirtableClient:
                 "Requested By": [person_id] if person_id else [],  # multipleRecordLinks
                 "Source": "Telegram",  # singleSelect
                 "Created At": movement.timestamp.strftime("%Y-%m-%d"),  # date
-                "Reason": "Issue" if movement.movement_type.value == "Out" else "Purchase" if movement.movement_type.value == "In" else "Adjustment",  # singleSelect
+                "Reason": "Purchase",  # singleSelect - Use Purchase for all movement types as safe fallback
                 # Note: Item Category and Item Base Unit are lookup fields, not directly settable
                 # Note: Is Posted is a formula field, not directly settable
                 # Note: Posted Qty exists but may be calculated differently
@@ -300,8 +300,7 @@ class AirtableClient:
                 
                 item_id = await self.create_item_if_not_exists(
                     movement.item_name, 
-                    movement.unit, 
-                    None,  # Let the method auto-detect category from item name
+                    movement.category or "General",  # Use movement category or default
                     unit_size,
                     unit_type
                 )
@@ -655,7 +654,7 @@ class AirtableClient:
                     item_name=fields.get("Item Name", item_name),
                     movement_type=movement_type,
                     quantity=fields.get("Quantity", 0.0),
-                    unit=fields.get("Unit", item.base_unit),
+                    unit=fields.get("Unit", item.unit_type),
                     signed_base_quantity=fields.get("Signed Base Quantity", 0.0),
                     user_id=fields.get("User ID", ""),
                     user_name=fields.get("User Name", "Unknown"),
@@ -675,6 +674,62 @@ class AirtableClient:
             
         except Exception as e:
             logger.error(f"Error getting movements for item '{item_name}': {e}")
+            return []
+
+    async def get_stock_movements_since(self, since_date: datetime, limit: int = 1000) -> List[StockMovement]:
+        """
+        Get all stock movements since a specific date.
+        
+        Args:
+            since_date: Get movements since this date
+            limit: Maximum number of movements to return
+            
+        Returns:
+            List of stock movements since the specified date
+        """
+        try:
+            # Convert datetime to ISO format for Airtable filtering
+            since_iso = since_date.isoformat()
+            
+            # Create formula to filter by timestamp
+            formula = f"AND(IS_AFTER({{Timestamp}}, '{since_iso}'))"
+            
+            # Get movements from the Stock Movements table
+            records = self.movements_table.all(formula=formula, max_records=limit)
+            
+            movements = []
+            for record in records:
+                fields = record["fields"]
+                
+                # Parse movement type
+                movement_type_str = fields.get("Movement Type", "IN")
+                try:
+                    movement_type = MovementType(movement_type_str)
+                except ValueError:
+                    movement_type = MovementType.IN
+                
+                # Create StockMovement object
+                movement = StockMovement(
+                    item_name=fields.get("Item Name", ""),
+                    movement_type=movement_type,
+                    quantity=fields.get("Quantity", 0.0),
+                    unit=fields.get("Unit", "piece"),
+                    signed_base_quantity=fields.get("Signed Base Quantity", 0.0),
+                    user_id=fields.get("User ID", ""),
+                    user_name=fields.get("User Name", "Unknown"),
+                    location=fields.get("Location", ""),
+                    project=fields.get("Project", ""),
+                    note=fields.get("Note", ""),
+                    timestamp=datetime.fromisoformat(fields.get("Timestamp", datetime.now().isoformat())),
+                    status=fields.get("Status", "Completed")
+                )
+                movements.append(movement)
+            
+            logger.info(f"Retrieved {len(movements)} movements since {since_date}")
+            return movements
+            
+        except Exception as e:
+            logger.error(f"Error getting movements since {since_date}: {e}")
             return []
     
     async def get_pending_approvals_for_item(self, item_name: str) -> List[dict]:

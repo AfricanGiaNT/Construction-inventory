@@ -1,6 +1,7 @@
 """Natural Language Parser for Stock Movement Commands."""
 
 import re
+import uuid
 from typing import Optional, Dict, Any, Tuple, List
 from datetime import datetime
 try:
@@ -441,6 +442,7 @@ class NLPStockParser:
                 
                 # Create movement
                 movement = StockMovement(
+                    id=str(uuid.uuid4()),  # Generate unique ID for duplicate detection
                     item_name=item_name,
                     movement_type=movement_type,
                     quantity=quantity,

@@ -106,6 +106,23 @@ class StockMovement(BaseModel):
     category: Optional[str] = None  # Category field for stock movements
 
 
+class BatchItem(BaseModel):
+    """Individual item within a batch."""
+    item_name: str
+    quantity: float
+    unit: Optional[str] = None
+
+
+class BatchInfo(BaseModel):
+    """Information about a single batch."""
+    batch_number: int
+    project: Optional[str] = "not described"
+    driver: Optional[str] = "not described"
+    to_location: Optional[str] = "external"  # For /out only
+    from_location: Optional[str] = "not described"  # For /in only
+    items: List[BatchItem]
+
+
 class BatchParseResult(BaseModel):
     """Result of parsing a batch of stock movements."""
     format: BatchFormat
@@ -115,6 +132,9 @@ class BatchParseResult(BaseModel):
     errors: List[str] = []
     is_valid: bool = True
     global_parameters: Dict[str, str] = Field(default_factory=dict)
+    # New fields for batch processing
+    batches: List[BatchInfo] = Field(default_factory=list)
+    total_items: int = 0
 
 
 class BatchError(BaseModel):
@@ -139,6 +159,83 @@ class BatchResult(BaseModel):
     processing_time_seconds: Optional[float] = None
     summary_message: str
     global_parameters: Dict[str, str] = Field(default_factory=dict)  # Global parameters used in the batch
+
+
+class DuplicateMatchType(str, Enum):
+    """Types of duplicate matches."""
+    EXACT = "exact"
+    SIMILAR = "similar"
+    FUZZY = "fuzzy"
+
+
+class DuplicateItem(BaseModel):
+    """Represents a duplicate item found in batch processing."""
+    batch_item: Dict[str, Any]  # BatchItem as dictionary
+    existing_item: Dict[str, Any]  # Item as dictionary
+    similarity_score: float
+    match_type: DuplicateMatchType
+    batch_number: int
+    item_index: int  # Index within the batch
+
+
+class DuplicateAnalysis(BaseModel):
+    """Analysis of duplicates found in batch processing."""
+    non_duplicates: List[BatchItem] = Field(default_factory=list)
+    duplicates: List[DuplicateItem] = Field(default_factory=list)
+    exact_matches: List[DuplicateItem] = Field(default_factory=list)
+    similar_items: List[DuplicateItem] = Field(default_factory=list)
+    total_items: int = 0
+    duplicate_count: int = 0
+    non_duplicate_count: int = 0
+
+
+class DuplicateProcessingResult(BaseModel):
+    """Result of processing duplicates."""
+    processed_duplicates: List[DuplicateItem] = Field(default_factory=list)
+    rejected_duplicates: List[DuplicateItem] = Field(default_factory=list)
+    merged_items: List[Item] = Field(default_factory=list)
+    new_items_created: List[Item] = Field(default_factory=list)
+    processing_errors: List[BatchError] = Field(default_factory=list)
+    success_count: int = 0
+    failure_count: int = 0
+    requires_user_confirmation: bool = False
+    pending_duplicates: List[DuplicateItem] = Field(default_factory=list)
+
+
+class DuplicateConfirmationRequest(BaseModel):
+    """Request for user confirmation of duplicate items."""
+    chat_id: int
+    user_id: int
+    user_name: str
+    duplicates: List[DuplicateItem]
+    movement_type: MovementType
+    batch_number: int
+    total_batches: int
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class DuplicateConfirmationAction(str, Enum):
+    """Actions available for duplicate confirmation."""
+    CONFIRM_INDIVIDUAL = "confirm_individual"
+    CANCEL_INDIVIDUAL = "cancel_individual"
+    CONFIRM_ALL = "confirm_all"
+    CANCEL_ALL = "cancel_all"
+    SHOW_ALL_MATCHES = "show_all_matches"
+    MERGE_QUANTITIES = "merge_quantities"
+    CREATE_NEW = "create_new"
+
+
+class PaginatedSearchResults(BaseModel):
+    """Paginated search results for stock queries."""
+    query: str
+    all_results: List[Item]  # All matching items
+    current_page: int
+    results_per_page: int = 5
+    total_pages: int
+    total_count: int
+    cache_timestamp: datetime
+    cache_key: str  # For state management
+    query_hash: str  # For callback data
 
 
 class BatchApproval(BaseModel):

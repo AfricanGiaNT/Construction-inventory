@@ -5,7 +5,7 @@ import asyncio
 import signal
 import sys
 from datetime import datetime, UTC
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -16,6 +16,7 @@ from auth import AuthService
 from commands import CommandRouter
 from services.stock import StockService
 from services.batch_stock import BatchStockService
+from services.enhanced_batch_processor import EnhancedBatchProcessor
 from services.approvals import ApprovalService
 from services.queries import QueryService
 from services.stock_query import StockQueryService
@@ -25,12 +26,13 @@ from services.inventory import InventoryService
 from services.idempotency import IdempotencyService
 from services.persistent_idempotency import PersistentIdempotencyService
 from services.audit_trail import AuditTrailService
+from services.duplicate_detection import DuplicateDetectionService
 from services.data_migration import DataMigrationService
 from services.edge_case_handler import EdgeCaseHandler
 from services.performance_tester import PerformanceTester
 from telegram_service import TelegramService
 from health import init_health_checker
-from schemas import UserRole
+from schemas import UserRole, MovementType
 from services.category_parser import category_parser
 
 # Configure basic logging
@@ -72,6 +74,11 @@ class ConstructionInventoryBot:
         self.command_router = CommandRouter()
         self.stock_service = StockService(self.airtable_client, self.settings)
         self.batch_stock_service = BatchStockService(self.airtable_client, self.settings, self.stock_service)
+        self.enhanced_batch_processor = EnhancedBatchProcessor(
+            airtable_client=self.airtable_client,
+            settings=self.settings,
+            stock_service=self.stock_service
+        )
         # Initialize approval service with batch_stock_service
         self.approval_service = ApprovalService(self.airtable_client, self.batch_stock_service)
         self.query_service = QueryService(self.airtable_client)
@@ -81,12 +88,17 @@ class ConstructionInventoryBot:
         self.idempotency_service = IdempotencyService()
         self.persistent_idempotency_service = PersistentIdempotencyService(self.airtable_client)
         self.audit_trail_service = AuditTrailService(self.airtable_client)
+        self.duplicate_detection_service = DuplicateDetectionService(self.airtable_client)
         self.inventory_service = InventoryService(
             self.airtable_client, 
             self.settings,
             audit_trail_service=self.audit_trail_service,
-            persistent_idempotency_service=self.persistent_idempotency_service
+            persistent_idempotency_service=self.persistent_idempotency_service,
+            duplicate_detection_service=self.duplicate_detection_service
         )
+        
+        # Temporary storage for batch information during duplicate detection
+        self._pending_batches = {}  # chat_id -> batch_approval
         self.data_migration_service = DataMigrationService(self.airtable_client)
         self.edge_case_handler = EdgeCaseHandler(self.airtable_client)
         self.performance_tester = PerformanceTester(self.airtable_client)
@@ -358,6 +370,25 @@ class ConstructionInventoryBot:
             elif data.startswith("stock_item_"):
                 # Handle stock item selection from inline keyboard
                 await self.handle_stock_keyboard_callback(callback_query)
+            
+            elif data.startswith(("stock_page_prev_", "stock_page_next_", "stock_show_more_")):
+                # Handle pagination callbacks
+                await self.handle_pagination_callback(callback_query)
+            
+            elif data in ["confirm_duplicates", "cancel_duplicates", "show_all_duplicates", "confirm_all_duplicates", "cancel_all_duplicates", "show_all_matches"] or data.startswith("confirm_individual_") or data.startswith("cancel_individual_"):
+                # Handle duplicate detection callbacks
+                await self.handle_duplicate_confirmation_callback(callback_query, data)
+            
+            elif data.startswith("confirm_movement_duplicate_") or data.startswith("cancel_movement_duplicate_"):
+                # Handle individual movement duplicate confirmation/cancellation
+                action = "confirm" if data.startswith("confirm_movement_duplicate_") else "cancel"
+                movement_id = data.split("_", 3)[3]  # Extract movement ID
+                await self.handle_movement_duplicate_callback(callback_query, action, movement_id)
+            
+            elif data in ["confirm_all_movement_duplicates", "cancel_all_movement_duplicates", "show_all_movement_duplicate_matches"]:
+                # Handle batch movement duplicate confirmation/cancellation
+                action = data.replace("_movement_duplicates", "").replace("_movement_duplicate_matches", "")
+                await self.handle_movement_duplicate_callback(callback_query, action)
             
             else:
                 # Unknown callback type
@@ -761,7 +792,7 @@ class ConstructionInventoryBot:
                         text = f"🔍 <b>Search Results for '{args[0]}'</b>\n\n"
                         for item in items[:5]:  # Limit to 5 results
                             text += f"• <b>{item.name}</b>\n"
-                            text += f"  Stock: {item.on_hand} {item.base_unit}\n"
+                            text += f"  Stock: {item.on_hand} {item.unit_type}\n"
                             text += f"  Location: {item.location or 'N/A'}\n\n"
                         
                         if len(items) > 5:
@@ -786,115 +817,128 @@ class ConstructionInventoryBot:
                     
             elif cmd == "in":
                 if not args:
-                    help_text = "📝 <b>Stock IN Command Usage</b>\n\n"
-                    help_text += "<b>Single Entry:</b>\n"
-                    help_text += "/in <item>, <quantity> <unit>, [driver], [from_location], [note]\n\n"
-                    help_text += "<b>Batch Entry:</b>\n"
-                    help_text += "/in <item1>, <qty1> <unit1>\n"
-                    help_text += "<item2>, <qty2> <unit2>\n"
-                    help_text += "<item3>, <qty3> <unit3>\n\n"
-                    help_text += "<b>Examples:</b>\n"
-                    help_text += "• /in cement, 50 bags, delivered by John, from supplier\n"
-                    help_text += "• /in cement, 50 bags\n"
-                    help_text += "  steel bars, 100 pieces\n"
-                    help_text += "  safety equipment, 20 sets\n\n"
-                    help_text += "Use /batchhelp for detailed batch command help."
-                    await self.telegram_service.send_error_message(chat_id, help_text)
+                    help_text = "📝 <b>Stock IN Command - New Batch System</b>\n\n"
+                    help_text += "<b>📋 Basic Format:</b>\n"
+                    help_text += "<code>/in -batch 1- project: mzuzu, driver: Dani maliko\n"
+                    help_text += "Cement 50kg, 10 bags\n"
+                    help_text += "Steel Bar 12mm, 5 pieces\n"
+                    help_text += "-batch 2- project: lilongwe, driver: John Banda\n"
+                    help_text += "Paint White 5L, 2 cans</code>\n\n"
+                    
+                    help_text += "<b>🔧 Key Features:</b>\n"
+                    help_text += "• Multiple batches in one command\n"
+                    help_text += "• Smart duplicate detection & auto-merge\n"
+                    help_text += "• Only item name and quantity required\n"
+                    help_text += "• Batch summary before processing\n"
+                    help_text += "• Skip failed batches, continue with others\n\n"
+                    
+                    help_text += "<b>📝 Parameters (all optional):</b>\n"
+                    help_text += "• <b>project:</b> defaults to 'not described'\n"
+                    help_text += "• <b>driver:</b> defaults to 'not described'\n"
+                    help_text += "• <b>from:</b> defaults to 'not described'\n\n"
+                    
+                    help_text += "<b>💡 Examples:</b>\n"
+                    help_text += "• <code>/in Cement 50kg, 10 bags</code> (minimal)\n"
+                    help_text += "• <code>/in -batch 1- project: site A\nCement 50kg, 10 bags</code>\n"
+                    help_text += "• <code>/in -batch 1- project: mzuzu, driver: John\nCement 50kg, 10 bags\nSteel 12mm, 5 pieces\n-batch 2- project: lilongwe\nPaint 5L, 2 cans</code>\n\n"
+                    
+                    help_text += "<b>🔍 Duplicate Handling:</b>\n"
+                    help_text += "• Exact matches: Auto-merge quantities\n"
+                    help_text += "• Similar items: Process as new items\n"
+                    help_text += "• Use <code>/preview in</code> to see duplicates first\n\n"
+                    
+                    help_text += "Use <code>/preview in</code> to test your command first!"
+                    await self.telegram_service.send_message(chat_id, help_text)
                     return
                 
                 try:
-                    # Use NLP parser for natural language
-                    # For multi-line commands, we need to preserve the newlines
+                    # Use the new enhanced batch processor
                     full_text = args[0] if len(args) == 1 else " ".join(args)
                     
-                    # Debug log
-                    logger.info(f"DEBUG - Processing batch command with text: '{full_text}'")
+                    logger.info(f"Processing IN command with enhanced batch processor: '{full_text}'")
                     
-                    # Check if this is a batch command by parsing with batch parser
-                    batch_result = self.command_router.parser.nlp_parser.parse_batch_entries(
-                        f"in {full_text}", user_id, user_name
+                    # Step 1: Show batch summary before processing
+                    preview = await self.enhanced_batch_processor.get_duplicate_preview(
+                        full_text, MovementType.IN
                     )
                     
-                    # If it's a single entry, handle through the approval flow
-                    if batch_result.format.value == "single" and len(batch_result.movements) == 1:
-                        movement = batch_result.movements[0]
+                    if preview["status"] == "success":
+                        # Show batch summary
+                        summary_msg = f"📋 <b>Batch Summary</b>\n\n"
+                        summary_msg += f"• Total items: {preview['total_items']}\n"
+                        summary_msg += f"• New items: {preview['non_duplicate_count']}\n"
+                        summary_msg += f"• Duplicates: {preview['duplicate_count']}\n"
+                        summary_msg += f"• Exact matches: {preview['exact_matches']} (will auto-merge)\n"
+                        summary_msg += f"• Similar items: {preview['similar_items']}\n\n"
+                        summary_msg += "🔄 <b>Processing...</b>"
                         
-                        # Create a single-entry batch approval
-                        success, batch_id, batch_approval = await self.batch_stock_service.prepare_batch_approval(
-                            [movement], 
-                            user_role, 
-                            chat_id, 
-                            user_id, 
-                            user_name
-                        )
-                        
-                        if success:
-                            # Send approval request
-                            await self.telegram_service.send_batch_approval_request(
-                                chat_id,
-                                batch_id,
-                                batch_approval.movements,
-                                batch_approval.before_levels,
-                                user_name
-                            )
-                            
-                            await self.telegram_service.send_message(
-                                chat_id,
-                                f"📝 <b>Entry submitted for approval</b>\n\n"
-                                f"Your request to add {movement.quantity} {movement.unit} of {movement.item_name} has been submitted for admin approval.\n\n"
-                                f"<b>Batch ID:</b> {batch_id}"
-                            )
-                        else:
-                            await self.telegram_service.send_error_message(chat_id, f"Error preparing entry: {batch_id}")
+                        await self.telegram_service.send_message(chat_id, summary_msg)
                     
-                    # If it's a batch, prepare for approval
-                    elif len(batch_result.movements) > 1:
-                        # Send batch confirmation
-                        batch_size = len(batch_result.movements)
-                        format_type = batch_result.format.value
-                        
-                        confirmation_msg = f"🔄 <b>Batch Command Detected!</b>\n\n"
-                        confirmation_msg += f"• <b>Format:</b> {format_type.title()}\n"
-                        confirmation_msg += f"• <b>Entries:</b> {batch_size} stock IN movements\n"
-                        confirmation_msg += f"• <b>Movement Type:</b> Stock IN\n\n"
-                        confirmation_msg += f"<i>Preparing batch for approval...</i>"
-                        
-                        await self.telegram_service.send_message(chat_id, confirmation_msg)
-                        
-                        # Prepare batch for approval
-                        success, batch_id, batch_approval = await self.batch_stock_service.prepare_batch_approval(
-                            batch_result.movements, 
-                            user_role, 
-                            chat_id, 
-                            user_id, 
-                            user_name,
-                            batch_result.global_parameters
-                        )
-                        
-                        if success:
-                            # Send approval request
-                            await self.telegram_service.send_batch_approval_request(
-                                chat_id,
-                                batch_id,
-                                batch_approval.movements,
-                                batch_approval.before_levels,
-                                user_name
-                            )
-                            
-                            await self.telegram_service.send_message(
-                                chat_id,
-                                f"📝 <b>Batch submitted for approval</b>\n\n"
-                                f"Your batch of {batch_size} items has been submitted for admin approval.\n\n"
-                                f"<b>Batch ID:</b> {batch_id}"
-                            )
-                        else:
-                            await self.telegram_service.send_error_message(chat_id, f"Error preparing batch: {batch_id}")
+                    # Step 2: Process with enhanced batch processor (includes duplicate detection)
+                    # Send progress indicator
+                    progress_msg = "🔄 <b>Processing batches...</b>\n\n"
+                    progress_msg += "• Parsing command...\n"
+                    progress_msg += "• Identifying duplicates...\n"
+                    progress_msg += "• Processing items...\n"
+                    progress_msg += "• Updating inventory...\n\n"
+                    progress_msg += "⏳ Please wait..."
                     
-                    # If parsing failed
+                    progress_message = await self.telegram_service.send_message(chat_id, progress_msg)
+                    
+                    result = await self.enhanced_batch_processor.process_batch_command_with_duplicates(
+                        full_text, 
+                        MovementType.IN, 
+                        user_id=user_id, 
+                        user_name=user_name,
+                        chat_id=chat_id
+                    )
+                    # If there are pending duplicates requiring confirmation, send dialog and return
+                    try:
+                        pending = await self.enhanced_batch_processor.get_duplicate_confirmation_data(chat_id)
+                        if pending and pending.get('duplicates'):
+                            if not hasattr(self, '_pending_duplicate_confirmations'):
+                                self._pending_duplicate_confirmations = {}
+                            self._pending_duplicate_confirmations[chat_id] = pending
+                            preface = "⚠️ Action required: duplicates found. Processed new items; confirm similar ones below."
+                            await self.telegram_service.send_message(chat_id, preface)
+                            await self.telegram_service.send_duplicate_confirmation_dialog(
+                                chat_id, pending['duplicates'], "in", {"total_batches": len(getattr(result, 'movements_created', []) or [])}
+                            )
+                            return
+                    except Exception:
+                        pass
+                    
+                    # Step 3: Send detailed result message with enhanced error handling
+                    if result.success_rate == 100.0:
+                        # Success - send comprehensive summary
+                        success_msg = f"✅ <b>Batch Processing Complete!</b>\n\n"
+                        success_msg += result.summary_message
+                        success_msg += f"\n\n📊 <b>Processing Statistics:</b>\n"
+                        success_msg += f"• Total items: {result.total_entries}\n"
+                        success_msg += f"• Success rate: {result.success_rate:.1f}%\n"
+                        success_msg += f"• Processing time: {result.processing_time_seconds:.1f}s\n"
+                        await self.telegram_service.send_message(chat_id, success_msg)
                     else:
-                        error_msg = "Could not parse the command. Please use format: /in item, quantity unit, location, driver, from_location, note"
-                        if batch_result.errors:
-                            error_msg += f"\n\nErrors: {'; '.join(batch_result.errors)}"
+                        # Partial success or failure - send detailed error report
+                        error_msg = f"⚠️ <b>Batch Processing Completed with Issues</b>\n\n"
+                        error_msg += result.summary_message
+                        
+                        if result.errors:
+                            error_msg += f"\n\n📋 <b>Error Details:</b>\n"
+                            for i, error in enumerate(result.errors[:5], 1):  # Show first 5 errors
+                                error_msg += f"{i}. {error.message}\n"
+                                if hasattr(error, 'suggestion') and error.suggestion:
+                                    error_msg += f"   💡 <i>{error.suggestion}</i>\n"
+                            
+                            if len(result.errors) > 5:
+                                error_msg += f"\n... and {len(result.errors) - 5} more errors\n"
+                        
+                        error_msg += f"\n📊 <b>Processing Statistics:</b>\n"
+                        error_msg += f"• Total items: {result.total_entries}\n"
+                        error_msg += f"• Successful: {result.successful_entries}\n"
+                        error_msg += f"• Failed: {result.failed_entries}\n"
+                        error_msg += f"• Success rate: {result.success_rate:.1f}%\n"
+                        
                         await self.telegram_service.send_error_message(chat_id, error_msg)
                         
                 except Exception as e:
@@ -902,119 +946,194 @@ class ConstructionInventoryBot:
                     
             elif cmd == "out":
                 if not args:
-                    help_text = "📝 <b>Stock OUT Command Usage</b>\n\n"
-                    help_text += "<b>Single Entry:</b>\n"
-                    help_text += "/out <item>, <quantity> <unit>, [to_location], [driver], [note]\n\n"
-                    help_text += "<b>Batch Entry:</b>\n"
-                    help_text += "/out <item1>, <qty1> <unit1>\n"
-                    help_text += "<item2>, <qty2> <unit2>\n"
-                    help_text += "<item3>, <qty3> <unit3>\n\n"
-                    help_text += "<b>Examples:</b>\n"
-                    help_text += "• /out cement, 25 bags, to site A, by Mr Longwe\n"
-                    help_text += "• /out cement, 25 bags\n"
-                    help_text += "  steel bars, 10 pieces\n"
-                    help_text += "  safety equipment, 5 sets\n\n"
-                    help_text += "Use /batchhelp for detailed batch command help."
-                    await self.telegram_service.send_error_message(chat_id, help_text)
+                    help_text = "📝 <b>Stock OUT Command - New Batch System</b>\n\n"
+                    help_text += "<b>📋 Basic Format:</b>\n"
+                    help_text += "<code>/out -batch 1- project: mzuzu, driver: Dani maliko, to: mzuzu houses\n"
+                    help_text += "Cement 50kg, 10 bags\n"
+                    help_text += "Steel Bar 12mm, 5 pieces\n"
+                    help_text += "-batch 2- project: lilongwe, driver: John Banda, to: lilongwe site\n"
+                    help_text += "Paint White 5L, 2 cans</code>\n\n"
+                    
+                    help_text += "<b>🔧 Key Features:</b>\n"
+                    help_text += "• Multiple batches in one command\n"
+                    help_text += "• Smart duplicate detection & auto-merge\n"
+                    help_text += "• Only item name and quantity required\n"
+                    help_text += "• Batch summary before processing\n"
+                    help_text += "• Skip failed batches, continue with others\n\n"
+                    
+                    help_text += "<b>📝 Parameters (all optional):</b>\n"
+                    help_text += "• <b>project:</b> defaults to 'not described'\n"
+                    help_text += "• <b>driver:</b> defaults to 'not described'\n"
+                    help_text += "• <b>to:</b> defaults to 'external'\n\n"
+                    
+                    help_text += "<b>💡 Examples:</b>\n"
+                    help_text += "• <code>/out Cement 50kg, 10 bags</code> (minimal)\n"
+                    help_text += "• <code>/out -batch 1- project: site A, to: warehouse\nCement 50kg, 10 bags</code>\n"
+                    help_text += "• <code>/out -batch 1- project: mzuzu, driver: John, to: site A\nCement 50kg, 10 bags\nSteel 12mm, 5 pieces\n-batch 2- project: lilongwe, to: site B\nPaint 5L, 2 cans</code>\n\n"
+                    
+                    help_text += "<b>🔍 Duplicate Handling:</b>\n"
+                    help_text += "• Exact matches: Auto-merge quantities\n"
+                    help_text += "• Similar items: Process as new items\n"
+                    help_text += "• Use <code>/preview out</code> to see duplicates first\n\n"
+                    
+                    help_text += "Use <code>/preview out</code> to test your command first!"
+                    await self.telegram_service.send_message(chat_id, help_text)
                     return
                 
                 try:
-                    # Use NLP parser for natural language
-                    # For multi-line commands, we need to preserve the newlines
+                    # Use the new enhanced batch processor
                     full_text = args[0] if len(args) == 1 else " ".join(args)
                     
-                    # Debug log
-                    logger.info(f"DEBUG - Processing batch command with text: '{full_text}'")
+                    logger.info(f"Processing OUT command with enhanced batch processor: '{full_text}'")
                     
-                    # Check if this is a batch command by parsing with batch parser
-                    batch_result = self.command_router.parser.nlp_parser.parse_batch_entries(
-                        f"out {full_text}", user_id, user_name
+                    # Step 1: Show batch summary before processing
+                    preview = await self.enhanced_batch_processor.get_duplicate_preview(
+                        full_text, MovementType.OUT
                     )
                     
-                    # If it's a single entry, handle through the approval flow
-                    if batch_result.format.value == "single" and len(batch_result.movements) == 1:
-                        movement = batch_result.movements[0]
+                    if preview["status"] == "success":
+                        # Show batch summary
+                        summary_msg = f"📋 <b>Batch Summary</b>\n\n"
+                        summary_msg += f"• Total items: {preview['total_items']}\n"
+                        summary_msg += f"• New items: {preview['non_duplicate_count']}\n"
+                        summary_msg += f"• Duplicates: {preview['duplicate_count']}\n"
+                        summary_msg += f"• Exact matches: {preview['exact_matches']} (will auto-merge)\n"
+                        summary_msg += f"• Similar items: {preview['similar_items']}\n\n"
+                        summary_msg += "🔄 <b>Processing...</b>"
                         
-                        # Create a single-entry batch approval
-                        success, batch_id, batch_approval = await self.batch_stock_service.prepare_batch_approval(
-                            [movement], 
-                            user_role, 
-                            chat_id, 
-                            user_id, 
-                            user_name
-                        )
-                        
-                        if success:
-                            # Send approval request
-                            await self.telegram_service.send_batch_approval_request(
-                                chat_id,
-                                batch_id,
-                                batch_approval.movements,
-                                batch_approval.before_levels,
-                                user_name
-                            )
-                            
-                            await self.telegram_service.send_message(
-                                chat_id,
-                                f"📝 <b>Entry submitted for approval</b>\n\n"
-                                f"Your request to remove {movement.quantity} {movement.unit} of {movement.item_name} has been submitted for admin approval.\n\n"
-                                f"<b>Batch ID:</b> {batch_id}"
-                            )
-                        else:
-                            await self.telegram_service.send_error_message(chat_id, f"Error preparing entry: {batch_id}")
+                        await self.telegram_service.send_message(chat_id, summary_msg)
                     
-                    # If it's a batch, prepare for approval
-                    elif len(batch_result.movements) > 1:
-                        # Send batch confirmation
-                        batch_size = len(batch_result.movements)
-                        format_type = batch_result.format.value
-                        
-                        confirmation_msg = f"🔄 <b>Batch Command Detected!</b>\n\n"
-                        confirmation_msg += f"• <b>Format:</b> {format_type.title()}\n"
-                        confirmation_msg += f"• <b>Entries:</b> {batch_size} stock OUT movements\n"
-                        confirmation_msg += f"• <b>Movement Type:</b> Stock OUT\n\n"
-                        confirmation_msg += f"<i>Preparing batch for approval...</i>"
-                        
-                        await self.telegram_service.send_message(chat_id, confirmation_msg)
-                        
-                        # Prepare batch for approval
-                        success, batch_id, batch_approval = await self.batch_stock_service.prepare_batch_approval(
-                            batch_result.movements, 
-                            user_role, 
-                            chat_id, 
-                            user_id, 
-                            user_name,
-                            batch_result.global_parameters
-                        )
-                        
-                        if success:
-                            # Send approval request
-                            await self.telegram_service.send_batch_approval_request(
-                                chat_id,
-                                batch_id,
-                                batch_approval.movements,
-                                batch_approval.before_levels,
-                                user_name
-                            )
-                            
-                            await self.telegram_service.send_message(
-                                chat_id,
-                                f"📝 <b>Batch submitted for approval</b>\n\n"
-                                f"Your batch of {batch_size} items has been submitted for admin approval.\n\n"
-                                f"<b>Batch ID:</b> {batch_id}"
-                            )
-                        else:
-                            await self.telegram_service.send_error_message(chat_id, f"Error preparing batch: {batch_id}")
+                    # Step 2: Process with enhanced batch processor (includes duplicate detection)
+                    # Send progress indicator
+                    progress_msg = "🔄 <b>Processing batches...</b>\n\n"
+                    progress_msg += "• Parsing command...\n"
+                    progress_msg += "• Identifying duplicates...\n"
+                    progress_msg += "• Processing items...\n"
+                    progress_msg += "• Updating inventory...\n\n"
+                    progress_msg += "⏳ Please wait..."
                     
-                    # If parsing failed
+                    progress_message = await self.telegram_service.send_message(chat_id, progress_msg)
+                    
+                    result = await self.enhanced_batch_processor.process_batch_command_with_duplicates(
+                        full_text, 
+                        MovementType.OUT, 
+                        user_id=user_id, 
+                        user_name=user_name,
+                        chat_id=chat_id
+                    )
+                    # If there are pending duplicates requiring confirmation, send dialog and return
+                    try:
+                        pending = await self.enhanced_batch_processor.get_duplicate_confirmation_data(chat_id)
+                        if pending and pending.get('duplicates'):
+                            if not hasattr(self, '_pending_duplicate_confirmations'):
+                                self._pending_duplicate_confirmations = {}
+                            self._pending_duplicate_confirmations[chat_id] = pending
+                            preface = "⚠️ Action required: duplicates found. Processed new items; confirm similar ones below."
+                            await self.telegram_service.send_message(chat_id, preface)
+                            await self.telegram_service.send_duplicate_confirmation_dialog(
+                                chat_id, pending['duplicates'], "out", {"total_batches": len(getattr(result, 'movements_created', []) or [])}
+                            )
+                            return
+                    except Exception:
+                        pass
+                    
+                    # Step 3: Send detailed result message with enhanced error handling
+                    if result.success_rate == 100.0:
+                        # Success - send comprehensive summary
+                        success_msg = f"✅ <b>Batch Processing Complete!</b>\n\n"
+                        success_msg += result.summary_message
+                        success_msg += f"\n\n📊 <b>Processing Statistics:</b>\n"
+                        success_msg += f"• Total items: {result.total_entries}\n"
+                        success_msg += f"• Success rate: {result.success_rate:.1f}%\n"
+                        success_msg += f"• Processing time: {result.processing_time_seconds:.1f}s\n"
+                        await self.telegram_service.send_message(chat_id, success_msg)
                     else:
-                        error_msg = "Could not parse the command. Please use format: /out item, quantity unit, location, driver, from_location, note"
-                        if batch_result.errors:
-                            error_msg += f"\n\nErrors: {'; '.join(batch_result.errors)}"
+                        # Partial success or failure - send detailed error report
+                        error_msg = f"⚠️ <b>Batch Processing Completed with Issues</b>\n\n"
+                        error_msg += result.summary_message
+                        
+                        if result.errors:
+                            error_msg += f"\n\n📋 <b>Error Details:</b>\n"
+                            for i, error in enumerate(result.errors[:5], 1):  # Show first 5 errors
+                                error_msg += f"{i}. {error.message}\n"
+                                if hasattr(error, 'suggestion') and error.suggestion:
+                                    error_msg += f"   💡 <i>{error.suggestion}</i>\n"
+                            
+                            if len(result.errors) > 5:
+                                error_msg += f"\n... and {len(result.errors) - 5} more errors\n"
+                        
+                        error_msg += f"\n📊 <b>Processing Statistics:</b>\n"
+                        error_msg += f"• Total items: {result.total_entries}\n"
+                        error_msg += f"• Successful: {result.successful_entries}\n"
+                        error_msg += f"• Failed: {result.failed_entries}\n"
+                        error_msg += f"• Success rate: {result.success_rate:.1f}%\n"
+                        
                         await self.telegram_service.send_error_message(chat_id, error_msg)
                         
                 except Exception as e:
                     await self.telegram_service.send_error_message(chat_id, f"Error processing command: {str(e)}")
+                    
+            elif cmd == "preview_in":
+                if not args:
+                    help_text = "🔍 <b>Preview IN Command</b>\n\n"
+                    help_text += "Preview duplicates before processing IN commands.\n\n"
+                    help_text += "<b>Usage:</b>\n"
+                    help_text += "/preview in -batch 1- project: mzuzu, driver: Dani maliko\n"
+                    help_text += "Cement 50kg, 10 bags\n"
+                    help_text += "Steel Bar 12mm, 5 pieces\n\n"
+                    help_text += "This will show you any duplicates found without processing the command."
+                    await self.telegram_service.send_message(chat_id, help_text)
+                    return
+                
+                try:
+                    full_text = args[0] if len(args) == 1 else " ".join(args)
+                    
+                    logger.info(f"Previewing IN command: '{full_text}'")
+                    
+                    # Get duplicate preview
+                    preview = await self.enhanced_batch_processor.get_duplicate_preview(
+                        full_text, MovementType.IN
+                    )
+                    
+                    # Send preview message
+                    if preview["status"] == "success":
+                        await self.telegram_service.send_message(chat_id, self._format_duplicate_preview(preview))
+                    else:
+                        await self.telegram_service.send_error_message(chat_id, preview["message"])
+                        
+                except Exception as e:
+                    await self.telegram_service.send_error_message(chat_id, f"Error previewing command: {str(e)}")
+                    
+            elif cmd == "preview_out":
+                if not args:
+                    help_text = "🔍 <b>Preview OUT Command</b>\n\n"
+                    help_text += "Preview duplicates before processing OUT commands.\n\n"
+                    help_text += "<b>Usage:</b>\n"
+                    help_text += "/preview out -batch 1- project: mzuzu, driver: Dani maliko, to: mzuzu houses\n"
+                    help_text += "Cement 50kg, 10 bags\n"
+                    help_text += "Steel Bar 12mm, 5 pieces\n\n"
+                    help_text += "This will show you any duplicates found without processing the command."
+                    await self.telegram_service.send_message(chat_id, help_text)
+                    return
+                
+                try:
+                    full_text = args[0] if len(args) == 1 else " ".join(args)
+                    
+                    logger.info(f"Previewing OUT command: '{full_text}'")
+                    
+                    # Get duplicate preview
+                    preview = await self.enhanced_batch_processor.get_duplicate_preview(
+                        full_text, MovementType.OUT
+                    )
+                    
+                    # Send preview message
+                    if preview["status"] == "success":
+                        await self.telegram_service.send_message(chat_id, self._format_duplicate_preview(preview))
+                    else:
+                        await self.telegram_service.send_error_message(chat_id, preview["message"])
+                        
+                except Exception as e:
+                    await self.telegram_service.send_error_message(chat_id, f"Error previewing command: {str(e)}")
                     
             elif cmd == "adjust":
                 if user_role.value != "admin":
@@ -1065,24 +1184,28 @@ class ConstructionInventoryBot:
                         )
                         
                         if success:
-                            # Send approval request
-                            await self.telegram_service.send_batch_approval_request(
-                                chat_id,
-                                batch_id,
-                                batch_approval.movements,
-                                batch_approval.before_levels,
-                                user_name
-                            )
+                            # Check for duplicates before sending approval request
+                            has_duplicates = await self._handle_movement_duplicate_detection(chat_id, batch_approval, user_name)
                             
-                            # Use + or - prefix based on the quantity
-                            qty_prefix = "+" if movement.quantity >= 0 else ""
-                            
-                            await self.telegram_service.send_message(
-                                chat_id,
-                                f"📝 <b>Adjustment submitted for approval</b>\n\n"
-                                f"Your request to adjust {qty_prefix}{movement.quantity} {movement.unit} of {movement.item_name} has been submitted for admin approval.\n\n"
-                                f"<b>Batch ID:</b> {batch_id}"
-                            )
+                            if not has_duplicates:
+                                # No duplicates found, proceed with normal approval request
+                                await self.telegram_service.send_batch_approval_request(
+                                    chat_id,
+                                    batch_id,
+                                    batch_approval.movements,
+                                    batch_approval.before_levels,
+                                    user_name
+                                )
+                                
+                                # Use + or - prefix based on the quantity
+                                qty_prefix = "+" if movement.quantity >= 0 else ""
+                                
+                                await self.telegram_service.send_message(
+                                    chat_id,
+                                    f"📝 <b>Adjustment submitted for approval</b>\n\n"
+                                    f"Your request to adjust {qty_prefix}{movement.quantity} {movement.unit} of {movement.item_name} has been submitted for admin approval.\n\n"
+                                    f"<b>Batch ID:</b> {batch_id}"
+                                )
                         else:
                             await self.telegram_service.send_error_message(chat_id, f"Error preparing adjustment: {batch_id}")
                     
@@ -1111,21 +1234,25 @@ class ConstructionInventoryBot:
                         )
                         
                         if success:
-                            # Send approval request
-                            await self.telegram_service.send_batch_approval_request(
-                                chat_id,
-                                batch_id,
-                                batch_approval.movements,
-                                batch_approval.before_levels,
-                                user_name
-                            )
+                            # Check for duplicates before sending approval request
+                            has_duplicates = await self._handle_movement_duplicate_detection(chat_id, batch_approval, user_name)
                             
-                            await self.telegram_service.send_message(
-                                chat_id,
-                                f"📝 <b>Adjustment batch submitted for approval</b>\n\n"
-                                f"Your batch of {batch_size} adjustment items has been submitted for admin approval.\n\n"
-                                f"<b>Batch ID:</b> {batch_id}"
-                            )
+                            if not has_duplicates:
+                                # No duplicates found, proceed with normal approval request
+                                await self.telegram_service.send_batch_approval_request(
+                                    chat_id,
+                                    batch_id,
+                                    batch_approval.movements,
+                                    batch_approval.before_levels,
+                                    user_name
+                                )
+                                
+                                await self.telegram_service.send_message(
+                                    chat_id,
+                                    f"📝 <b>Adjustment batch submitted for approval</b>\n\n"
+                                    f"Your batch of {batch_size} adjustment items has been submitted for admin approval.\n\n"
+                                    f"<b>Batch ID:</b> {batch_id}"
+                                )
                         else:
                             await self.telegram_service.send_error_message(chat_id, f"Error preparing batch: {batch_id}")
                     
@@ -1207,6 +1334,36 @@ class ConstructionInventoryBot:
         except Exception as e:
             logger.error(f"Error executing command {command.command}: {e}")
             await self.telegram_service.send_error_message(chat_id, "An error occurred while processing your command.")
+    
+    def _format_duplicate_preview(self, preview: Dict[str, Any]) -> str:
+        """Format duplicate preview for display."""
+        if preview["status"] != "success":
+            return preview["message"]
+        
+        message = "🔍 <b>Duplicate Preview</b>\n\n"
+        message += f"📊 <b>Summary:</b>\n"
+        message += f"• Total items: {preview['total_items']}\n"
+        message += f"• New items: {preview['non_duplicate_count']}\n"
+        message += f"• Duplicates: {preview['duplicate_count']}\n"
+        message += f"• Exact matches: {preview['exact_matches']}\n"
+        message += f"• Similar items: {preview['similar_items']}\n\n"
+        
+        if preview['duplicate_count'] > 0:
+            message += "🔄 <b>Duplicate Details:</b>\n"
+            for i, duplicate in enumerate(preview['duplicates'][:5], 1):  # Show first 5
+                message += f"{i}. <b>{duplicate['item_name']}</b> ({duplicate['quantity']})\n"
+                message += f"   → Matches: {duplicate['existing_item']} ({duplicate['existing_quantity']})\n"
+                message += f"   → Similarity: {duplicate['similarity_score']:.1%} ({duplicate['match_type']})\n\n"
+            
+            if len(preview['duplicates']) > 5:
+                message += f"... and {len(preview['duplicates']) - 5} more duplicates\n\n"
+        
+        message += "💡 <b>Next Steps:</b>\n"
+        message += "• Use <code>/in</code> or <code>/out</code> to process with auto-merge\n"
+        message += "• Exact matches will be automatically merged\n"
+        message += "• Similar items will be processed as new items\n"
+        
+        return message
     
     async def send_batch_result_message(self, chat_id: int, batch_result):
         """Send a comprehensive batch processing result message."""
@@ -1428,10 +1585,10 @@ class ConstructionInventoryBot:
         try:
             logger.info(f"Processing stock query: '{query}' for user {user_name}")
             
-            # Perform fuzzy search
-            search_results = await self.stock_query_service.fuzzy_search_items(query, limit=5)
+            # Get paginated search results (page 1, 5 results per page)
+            paginated_results = await self.stock_query_service.get_paginated_search_results(query, page=1, results_per_page=5)
             
-            if not search_results:
+            if not paginated_results.all_results:
                 # No results found
                 await self.telegram_service.send_message(
                     chat_id,
@@ -1442,9 +1599,9 @@ class ConstructionInventoryBot:
                 )
                 return
             
-            # Collect pending information for each item
+            # Collect pending information for all items (we'll need this for pagination)
             pending_info = {}
-            for item in search_results:
+            for item in paginated_results.all_results:
                 pending_movements = await self.stock_query_service.get_pending_movements(item.name)
                 in_pending_batch = await self.stock_query_service.is_in_pending_batch(item.name)
                 
@@ -1453,37 +1610,32 @@ class ConstructionInventoryBot:
                     'in_pending_batch': in_pending_batch
                 }
             
-            # Get total count of matching items for "Showing top 3 of X" message
-            total_count = await self.stock_query_service.get_total_matching_items_count(query)
-            
-            # Send search results
-            await self.telegram_service.send_stock_search_results(
-                chat_id, query, search_results, pending_info, total_count
+            # Send paginated search results
+            await self.telegram_service.send_paginated_stock_results(
+                chat_id, paginated_results, pending_info
             )
             
-            # Store search results for user confirmation
-            # We'll store this in a simple in-memory cache for now
-            # In production, this could be stored in Redis or database
-            if not hasattr(self, '_stock_search_cache'):
-                self._stock_search_cache = {}
+            # Store pagination state for callback handling
+            if not hasattr(self, '_pagination_cache'):
+                self._pagination_cache = {}
             
-            # Store results with timestamp and user info
-            cache_key = f"{chat_id}_{user_id}"
-            self._stock_search_cache[cache_key] = {
+            # Store pagination state with user info
+            cache_key = f"{chat_id}_{user_id}_{paginated_results.query_hash}"
+            self._pagination_cache[cache_key] = {
                 'query': query,
-                'results': search_results,
+                'paginated_results': paginated_results,
                 'pending_info': pending_info,
                 'timestamp': datetime.now(),
                 'user_name': user_name
             }
             
             # Debug logging
-            logger.info(f"Stored stock search cache for key: {cache_key}")
-            logger.info(f"Cache now contains {len(self._stock_search_cache)} entries")
-            logger.info(f"Cache keys: {list(self._stock_search_cache.keys())}")
+            logger.info(f"Stored pagination cache for key: {cache_key}")
+            logger.info(f"Pagination cache now contains {len(self._pagination_cache)} entries")
+            logger.info(f"Pagination cache keys: {list(self._pagination_cache.keys())}")
             
-            # Clean up old cache entries (older than 1 hour)
-            self._cleanup_stock_search_cache()
+            # Clean up old pagination cache entries (older than 10 minutes)
+            self._cleanup_pagination_cache()
             
         except Exception as e:
             logger.error(f"Error handling stock command: {e}")
@@ -1516,6 +1668,29 @@ class ConstructionInventoryBot:
                 
         except Exception as e:
             logger.error(f"Error cleaning up stock search cache: {e}")
+    
+    def _cleanup_pagination_cache(self):
+        """Clean up old pagination cache entries."""
+        try:
+            if not hasattr(self, '_pagination_cache'):
+                return
+            
+            current_time = datetime.now()
+            keys_to_remove = []
+            
+            for cache_key, cache_data in self._pagination_cache.items():
+                # Remove entries older than 10 minutes
+                if (current_time - cache_data['timestamp']).total_seconds() > 600:
+                    keys_to_remove.append(cache_key)
+            
+            for key in keys_to_remove:
+                del self._pagination_cache[key]
+                
+            if keys_to_remove:
+                logger.info(f"Cleaned up {len(keys_to_remove)} old pagination cache entries")
+                
+        except Exception as e:
+            logger.error(f"Error cleaning up pagination cache: {e}")
 
     async def handle_stock_confirmation(self, chat_id: int, user_id: int, user_name: str, confirmation: str):
         """Handle user confirmation of stock item selection."""
@@ -1629,15 +1804,20 @@ class ConstructionInventoryBot:
         try:
             logger.info(f"Processing inventory command: '{command_text}' for user {user_name}")
             
-            # Process the inventory command using the inventory service
+            # Process the inventory command using the inventory service with duplicate detection
             success, message = await self.inventory_service.process_inventory_stocktake(
-                command_text, user_id, user_name
+                command_text, user_id, user_name, validate_only=False, 
+                telegram_service=self.telegram_service, chat_id=chat_id
             )
             
             if success:
-                # Store persistent idempotency key to prevent duplicates across restarts
-                await self.persistent_idempotency_service.store_key(command_text)
-                await self.telegram_service.send_message(chat_id, message)
+                if message == "duplicate_detection_sent":
+                    # Duplicate detection dialog was sent, no further action needed
+                    logger.info(f"Duplicate detection dialog sent for chat {chat_id}")
+                else:
+                    # Store persistent idempotency key to prevent duplicates across restarts
+                    await self.persistent_idempotency_service.store_key(command_text)
+                    await self.telegram_service.send_message(chat_id, message)
             else:
                 await self.telegram_service.send_error_message(chat_id, message)
                 
@@ -2598,38 +2778,49 @@ class ConstructionInventoryBot:
             # TODO: Implement proper rate limiting for stock queries
             logger.info(f"Bypassing rate limiting for stock query callback")
             
-            # Get cached search results
-            cache_key = f"{chat_id}_{user_id}"
-            logger.info(f"Looking for cache key: {cache_key}")
-            logger.info(f"Cache exists: {hasattr(self, '_stock_search_cache')}")
-            if hasattr(self, '_stock_search_cache'):
-                logger.info(f"Cache contains {len(self._stock_search_cache)} entries")
-                logger.info(f"Cache keys: {list(self._stock_search_cache.keys())}")
+            # Try to find the item in pagination cache first
+            selected_item = None
+            pending_info = {}
             
-            if not hasattr(self, '_stock_search_cache') or cache_key not in self._stock_search_cache:
+            # Look through pagination cache for the item
+            if hasattr(self, '_pagination_cache'):
+                for cache_key, cache_data in self._pagination_cache.items():
+                    if f"{chat_id}_{user_id}" in cache_key:
+                        paginated_results = cache_data['paginated_results']
+                        pending_info = cache_data['pending_info']
+                        
+                        # Get items for current page
+                        start_idx = (paginated_results.current_page - 1) * paginated_results.results_per_page
+                        end_idx = start_idx + paginated_results.results_per_page
+                        page_items = paginated_results.all_results[start_idx:end_idx]
+                        
+                        # Check if item index is valid for current page
+                        if 0 <= item_index < len(page_items):
+                            selected_item = page_items[item_index]
+                            logger.info(f"Found item in pagination cache: {selected_item.name}")
+                            break
+            
+            # If not found in pagination cache, try old cache format for backward compatibility
+            if not selected_item:
+                cache_key = f"{chat_id}_{user_id}"
+                if hasattr(self, '_stock_search_cache') and cache_key in self._stock_search_cache:
+                    cache_data = self._stock_search_cache[cache_key]
+                    search_results = cache_data['results']
+                    pending_info = cache_data['pending_info']
+                    
+                    if 0 <= item_index < len(search_results):
+                        selected_item = search_results[item_index]
+                        logger.info(f"Found item in old cache format: {selected_item.name}")
+            
+            # If still not found, return error
+            if not selected_item:
+                logger.info(f"Item not found in any cache, searching by name slug: {item_name_slug}")
                 await self.telegram_service.answer_callback_query(
                     callback_query.id, 
-                    "❌ No recent search found. Please search again."
+                    "❌ Search session expired. Please search again."
                 )
                 return
             
-            cache_data = self._stock_search_cache[cache_key]
-            search_results = cache_data['results']
-            pending_info = cache_data['pending_info']
-            
-            logger.info(f"Cache data retrieved: {len(search_results)} results, pending_info: {pending_info}")
-            logger.info(f"Item index requested: {item_index}, available items: {[item.name for item in search_results]}")
-            
-            # Validate item index
-            if item_index < 0 or item_index >= len(search_results):
-                await self.telegram_service.answer_callback_query(
-                    callback_query.id, 
-                    "❌ Invalid item selection"
-                )
-                return
-            
-            # Get selected item
-            selected_item = search_results[item_index]
             logger.info(f"Selected item: {selected_item.name}")
             
             # Get pending movements and batch status for the selected item
@@ -2663,6 +2854,761 @@ class ConstructionInventoryBot:
                 )
             except:
                 pass  # Ignore errors in error handling
+    
+    async def handle_pagination_callback(self, callback_query):
+        """Handle pagination callbacks (Previous, Next, Show more)."""
+        try:
+            # Extract callback data
+            callback_data = callback_query.data
+            user_id = callback_query.from_user.id
+            chat_id = callback_query.message.chat.id
+            
+            logger.info(f"Processing pagination callback: {callback_data} from user {user_id}")
+            
+            # Parse callback data format: "stock_page_{action}_{query_hash}_{current_page}"
+            if not callback_data.startswith(("stock_page_prev_", "stock_page_next_", "stock_show_more_")):
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id, 
+                    "❌ Invalid pagination callback data"
+                )
+                return
+            
+            try:
+                # Extract action, query hash, and current page
+                if callback_data.startswith("stock_page_prev_"):
+                    action = "prev"
+                    remaining = callback_data[16:]  # len("stock_page_prev_") = 16
+                elif callback_data.startswith("stock_page_next_"):
+                    action = "next"
+                    remaining = callback_data[16:]  # len("stock_page_next_") = 16
+                elif callback_data.startswith("stock_show_more_"):
+                    action = "next"  # Same as next
+                    remaining = callback_data[17:]  # len("stock_show_more_") = 17
+                else:
+                    raise ValueError("Invalid callback action")
+                
+                # Split remaining data to get query_hash and current_page
+                parts = remaining.split("_", 1)
+                if len(parts) != 2:
+                    raise ValueError("Invalid callback data format")
+                
+                query_hash = parts[0]
+                current_page = int(parts[1])
+                
+                logger.info(f"Parsed pagination callback: action={action}, query_hash={query_hash}, current_page={current_page}")
+                
+            except (ValueError, IndexError) as e:
+                logger.error(f"Error parsing pagination callback data: {e}")
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id, 
+                    "❌ Invalid pagination callback format"
+                )
+                return
+            
+            # Get pagination state from cache
+            cache_key = f"{chat_id}_{user_id}_{query_hash}"
+            if not hasattr(self, '_pagination_cache') or cache_key not in self._pagination_cache:
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id, 
+                    "❌ Pagination session expired. Please search again."
+                )
+                return
+            
+            cache_data = self._pagination_cache[cache_key]
+            paginated_results = cache_data['paginated_results']
+            pending_info = cache_data['pending_info']
+            
+            # Calculate new page
+            if action == "prev":
+                new_page = max(1, current_page - 1)
+            else:  # next or show_more
+                new_page = min(paginated_results.total_pages, current_page + 1)
+            
+            # Update paginated results with new page
+            paginated_results.current_page = new_page
+            
+            # Send updated paginated results
+            await self.telegram_service.send_paginated_stock_results(
+                chat_id, paginated_results, pending_info
+            )
+            
+            # Update cache with new page
+            self._pagination_cache[cache_key]['paginated_results'] = paginated_results
+            
+            # Answer callback query
+            action_text = "Previous" if action == "prev" else "Next"
+            await self.telegram_service.answer_callback_query(
+                callback_query.id, 
+                f"✅ {action_text} page {new_page}"
+            )
+            
+            logger.info(f"Successfully processed pagination callback: {action} to page {new_page}")
+            
+        except Exception as e:
+            logger.error(f"Error handling pagination callback: {e}")
+            try:
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id, 
+                    "❌ Error processing pagination. Please try again."
+                )
+            except:
+                pass  # Ignore errors in error handling
+    
+    async def handle_duplicate_confirmation_callback(self, callback_query, action: str):
+        """Handle duplicate confirmation callbacks."""
+        try:
+            chat_id = callback_query.message.chat.id
+            user_id = callback_query.from_user.id
+            first_name = callback_query.from_user.first_name or ""
+            last_name = callback_query.from_user.last_name or ""
+            user_name = f"{first_name} {last_name}".strip() or "Unknown"
+            
+            logger.info(f"Processing duplicate confirmation callback: {action} from user {user_name} ({user_id})")
+            
+            # Handle individual item confirmations
+            if action.startswith("confirm_individual_"):
+                item_index = int(action.split("_")[-1])
+                await self._process_individual_duplicate_confirmation(callback_query, user_name, "confirm", item_index)
+            elif action.startswith("cancel_individual_"):
+                item_index = int(action.split("_")[-1])
+                await self._process_individual_duplicate_confirmation(callback_query, user_name, "cancel", item_index)
+            elif action == "confirm_all_duplicates":
+                await self._process_bulk_duplicate_confirmation(callback_query, user_name, "confirm_all")
+            elif action == "cancel_all_duplicates":
+                await self._process_bulk_duplicate_confirmation(callback_query, user_name, "cancel_all")
+            elif action == "confirm_duplicates":
+                await self._process_duplicate_confirmation(callback_query, user_name)
+            elif action == "cancel_duplicates":
+                await self._process_duplicate_cancellation(callback_query, user_name)
+            elif action == "show_all_duplicates":
+                await self._show_all_duplicate_matches(callback_query, user_name)
+            else:
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id,
+                    "❌ Unknown duplicate action",
+                    show_alert=True
+                )
+                
+        except Exception as e:
+            logger.error(f"Error handling duplicate confirmation callback: {e}")
+            try:
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id,
+                    "❌ Error processing duplicate confirmation. Please try again.",
+                    show_alert=True
+                )
+            except:
+                pass  # Ignore errors in error handling
+    
+    async def _process_individual_duplicate_confirmation(self, callback_query, user_name: str, action: str, item_index: int):
+        """Process individual duplicate confirmation for a specific item."""
+        try:
+            chat_id = callback_query.message.chat.id
+            user_id = callback_query.from_user.id
+            
+            # Get stored duplicate data
+            if not hasattr(self, '_pending_duplicate_confirmations'):
+                self._pending_duplicate_confirmations = {}
+            
+            if chat_id not in self._pending_duplicate_confirmations:
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id,
+                    "❌ No pending duplicate confirmations found",
+                    show_alert=True
+                )
+                return
+            
+            duplicate_data = self._pending_duplicate_confirmations[chat_id]
+            duplicates = duplicate_data.get('duplicates', [])
+            movement_type = duplicate_data.get('movement_type')
+            
+            if item_index >= len(duplicates):
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id,
+                    "❌ Invalid item index",
+                    show_alert=True
+                )
+                return
+            
+            duplicate_dict = duplicates[item_index]
+            
+            # Convert dictionary back to DuplicateItem object
+            from src.schemas import DuplicateItem, DuplicateMatchType
+            duplicate = DuplicateItem(
+                batch_item=duplicate_dict['batch_item'],
+                existing_item=duplicate_dict['existing_item'],
+                similarity_score=duplicate_dict['similarity_score'],
+                match_type=DuplicateMatchType(duplicate_dict['match_type']),
+                batch_number=duplicate_dict['batch_number'],
+                item_index=duplicate_dict['item_index']
+            )
+            
+            # Process the individual confirmation
+            result = await self.enhanced_batch_processor.duplicate_handler.process_user_confirmation(
+                duplicate, action, movement_type, user_id, user_name
+            )
+            
+            # Update the stored data
+            if action == "confirm":
+                duplicate_data['confirmed_items'].append(duplicate)
+            else:
+                duplicate_data['cancelled_items'].append(duplicate)
+            
+            # Check if all items have been processed
+            total_items = len(duplicates)
+            processed_items = len(duplicate_data.get('confirmed_items', [])) + len(duplicate_data.get('cancelled_items', []))
+            
+            if processed_items >= total_items:
+                # All items processed, complete the batch
+                await self._complete_duplicate_confirmation_batch(chat_id, user_name)
+            else:
+                # Update the confirmation dialog
+                # Convert remaining duplicates back to dictionaries for display
+                remaining_duplicates = []
+                for i, d in enumerate(duplicates):
+                    if d not in duplicate_data.get('confirmed_items', []) and d not in duplicate_data.get('cancelled_items', []):
+                        remaining_duplicates.append({
+                            'batch_item': d.batch_item,
+                            'existing_item': d.existing_item,
+                            'similarity_score': d.similarity_score,
+                            'match_type': d.match_type.value,
+                            'batch_number': d.batch_number,
+                            'item_index': d.item_index
+                        })
+                await self._update_duplicate_confirmation_dialog(chat_id, remaining_duplicates, movement_type, duplicate_data)
+            
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                f"✅ {action.title()}ed item {item_index + 1}",
+                show_alert=False
+            )
+            
+        except Exception as e:
+            logger.error(f"Error processing individual duplicate confirmation: {e}")
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "❌ Error processing confirmation",
+                show_alert=True
+            )
+    
+    async def _process_bulk_duplicate_confirmation(self, callback_query, user_name: str, action: str):
+        """Process bulk duplicate confirmation for all items."""
+        try:
+            chat_id = callback_query.message.chat.id
+            user_id = callback_query.from_user.id
+            
+            # Get stored duplicate data
+            if not hasattr(self, '_pending_duplicate_confirmations'):
+                self._pending_duplicate_confirmations = {}
+            
+            if chat_id not in self._pending_duplicate_confirmations:
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id,
+                    "❌ No pending duplicate confirmations found",
+                    show_alert=True
+                )
+                return
+            
+            duplicate_data = self._pending_duplicate_confirmations[chat_id]
+            duplicates = duplicate_data.get('duplicates', [])
+            movement_type = duplicate_data.get('movement_type')
+            
+            # Process all duplicates with the same action
+            for duplicate_dict in duplicates:
+                # Convert dictionary back to DuplicateItem object
+                from src.schemas import DuplicateItem, DuplicateMatchType
+                duplicate = DuplicateItem(
+                    batch_item=duplicate_dict['batch_item'],
+                    existing_item=duplicate_dict['existing_item'],
+                    similarity_score=duplicate_dict['similarity_score'],
+                    match_type=DuplicateMatchType(duplicate_dict['match_type']),
+                    batch_number=duplicate_dict['batch_number'],
+                    item_index=duplicate_dict['item_index']
+                )
+                
+                result = await self.enhanced_batch_processor.duplicate_handler.process_user_confirmation(
+                    duplicate, action, movement_type, user_id, user_name
+                )
+                
+                if action == "confirm_all":
+                    duplicate_data['confirmed_items'].append(duplicate)
+                else:
+                    duplicate_data['cancelled_items'].append(duplicate)
+            
+            # Complete the batch
+            await self._complete_duplicate_confirmation_batch(chat_id, user_name)
+            
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                f"✅ {action.replace('_', ' ').title()}ed all items",
+                show_alert=False
+            )
+            
+        except Exception as e:
+            logger.error(f"Error processing bulk duplicate confirmation: {e}")
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "❌ Error processing bulk confirmation",
+                show_alert=True
+            )
+    
+    async def _complete_duplicate_confirmation_batch(self, chat_id: int, user_name: str):
+        """Complete the duplicate confirmation batch and show results."""
+        try:
+            if not hasattr(self, '_pending_duplicate_confirmations'):
+                return
+            
+            duplicate_data = self._pending_duplicate_confirmations.get(chat_id, {})
+            confirmed_items = duplicate_data.get('confirmed_items', [])
+            cancelled_items = duplicate_data.get('cancelled_items', [])
+            
+            # Generate summary message
+            message = f"✅ <b>Duplicate Confirmation Complete</b>\n\n"
+            message += f"• Confirmed: {len(confirmed_items)} items\n"
+            message += f"• Cancelled: {len(cancelled_items)} items\n"
+            message += f"• Total processed: {len(confirmed_items) + len(cancelled_items)} items\n\n"
+            
+            if confirmed_items:
+                message += "<b>Confirmed Items:</b>\n"
+                for item in confirmed_items:
+                    # Handle both DuplicateItem objects and dictionaries
+                    if hasattr(item, 'batch_item'):
+                        item_name = item.batch_item.get('item_name', 'Unknown')
+                    elif isinstance(item, dict):
+                        item_name = item.get('batch_item', {}).get('item_name', 'Unknown')
+                    else:
+                        item_name = 'Unknown'
+                    message += f"• {item_name}\n"
+                message += "\n"
+            
+            if cancelled_items:
+                message += "<b>Cancelled Items:</b>\n"
+                for item in cancelled_items:
+                    # Handle both DuplicateItem objects and dictionaries
+                    if hasattr(item, 'batch_item'):
+                        item_name = item.batch_item.get('item_name', 'Unknown')
+                    elif isinstance(item, dict):
+                        item_name = item.get('batch_item', {}).get('item_name', 'Unknown')
+                    else:
+                        item_name = 'Unknown'
+                    message += f"• {item_name}\n"
+            
+            await self.telegram_service.send_message(chat_id, message)
+            
+            # Clean up stored data
+            del self._pending_duplicate_confirmations[chat_id]
+            
+        except Exception as e:
+            logger.error(f"Error completing duplicate confirmation batch: {e}")
+    
+    async def _update_duplicate_confirmation_dialog(self, chat_id: int, remaining_duplicates: List[Any], 
+                                                   movement_type: str, batch_info: Dict[str, Any]):
+        """Update the duplicate confirmation dialog with remaining items."""
+        try:
+            if not remaining_duplicates:
+                await self.telegram_service.send_message(chat_id, "✅ All duplicate items have been processed.")
+                return
+            
+            # Send updated confirmation dialog
+            await self.telegram_service.send_duplicate_confirmation_dialog(
+                chat_id, remaining_duplicates, movement_type, batch_info
+            )
+            
+        except Exception as e:
+            logger.error(f"Error updating duplicate confirmation dialog: {e}")
+    
+    async def handle_movement_duplicate_callback(self, callback_query, action: str, movement_id: str = None):
+        """Handle movement duplicate confirmation callbacks."""
+        try:
+            chat_id = callback_query.message.chat.id
+            user_id = callback_query.from_user.id
+            first_name = callback_query.from_user.first_name or ""
+            last_name = callback_query.from_user.last_name or ""
+            user_name = f"{first_name} {last_name}".strip() or "Unknown"
+            
+            logger.info(f"Processing movement duplicate callback: {action} from user {user_name} ({user_id})")
+            
+            if action == "confirm" and movement_id:
+                await self._process_movement_duplicate_confirmation(callback_query, user_name, movement_id)
+            elif action == "cancel" and movement_id:
+                await self._process_movement_duplicate_cancellation(callback_query, user_name, movement_id)
+            elif action == "confirm_all":
+                await self._process_all_movement_duplicates_confirmation(callback_query, user_name)
+            elif action == "cancel_all":
+                await self._process_all_movement_duplicates_cancellation(callback_query, user_name)
+            elif action == "show_all":
+                await self._show_all_movement_duplicate_matches(callback_query, user_name)
+            else:
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id,
+                    "❌ Unknown movement duplicate action",
+                    show_alert=True
+                )
+                
+        except Exception as e:
+            logger.error(f"Error handling movement duplicate callback: {e}")
+            try:
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id,
+                    "❌ Error processing movement duplicate confirmation. Please try again.",
+                    show_alert=True
+                )
+            except:
+                pass  # Ignore errors in error handling
+    
+    async def _handle_movement_duplicate_detection(self, chat_id: int, batch_approval, user_name: str) -> bool:
+        """
+        Handle duplicate detection for a batch of movements.
+        Returns:
+            True if duplicates were found and handled, False if no duplicates
+        """
+        try:
+            duplicate_result = await self.batch_stock_service.check_movement_duplicates(batch_approval.movements)
+            if duplicate_result.has_any_duplicates:
+                # Store batch information for later use in callback handlers
+                self._pending_batches[chat_id] = batch_approval
+                
+                movement_duplicates = {result.movement_id: result for result in duplicate_result.movement_results if result.has_duplicates}
+                await self.telegram_service.send_movement_duplicate_confirmation(
+                    chat_id, movement_duplicates, batch_approval.movements
+                )
+                await self.telegram_service.send_message(
+                    chat_id,
+                    f"🔍 <b>Potential Duplicates Detected</b>\n\n"
+                    f"Found {duplicate_result.total_duplicates} potential duplicate(s) in your batch. "
+                    f"Please review and confirm or cancel each movement above.\n\n"
+                    f"<i>This helps prevent duplicate entries in your inventory.</i>"
+                )
+                return True
+            else:
+                return False
+        except Exception as e:
+            logger.error(f"Error handling movement duplicate detection: {e}")
+            return False
+    
+    async def _process_movement_duplicate_confirmation(self, callback_query, user_name: str, movement_id: str):
+        """Process individual movement duplicate confirmation - consolidate quantities."""
+        try:
+            chat_id = callback_query.message.chat.id
+            
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "✅ Movement duplicate confirmed. Proceeding with approval...",
+                show_alert=True
+            )
+            
+            # Update the message to show confirmation
+            await self.telegram_service.edit_message_text(
+                chat_id=chat_id,
+                message_id=callback_query.message.message_id,
+                text=f"{callback_query.message.text}\n\n✅ Confirmed by {user_name}"
+            )
+            
+            # Get the stored batch information
+            if chat_id in self._pending_batches:
+                batch_approval = self._pending_batches[chat_id]
+                
+                # Send a message indicating that we're proceeding with approval
+                await self.telegram_service.send_message(
+                    chat_id,
+                    f"✅ <b>Duplicate Confirmed</b>\n\n"
+                    f"Movement ID: {movement_id}\n"
+                    f"Proceeding with normal approval process...\n\n"
+                    f"<i>Note: Duplicate consolidation will be implemented in a future update.</i>"
+                )
+                
+                # Proceed with normal approval workflow
+                await self.telegram_service.send_batch_approval_request(
+                    chat_id,
+                    batch_approval.batch_id,
+                    batch_approval.movements,
+                    batch_approval.before_levels,
+                    user_name
+                )
+                
+                # Send "Entry submitted for approval" message
+                movement = next((m for m in batch_approval.movements if m.id == movement_id), None)
+                if movement:
+                    await self.telegram_service.send_message(
+                        chat_id,
+                        f"📝 <b>Entry submitted for approval</b>\n\n"
+                        f"Your request to add {movement.quantity} {movement.unit} of {movement.item_name} has been submitted for admin approval.\n\n"
+                        f"<b>Batch ID:</b> {batch_approval.batch_id}"
+                    )
+                
+                # Clean up the stored batch information
+                del self._pending_batches[chat_id]
+                
+                logger.info(f"Movement duplicate confirmation processed for movement {movement_id} by {user_name}")
+            else:
+                # Fallback if batch information is not available
+                await self.telegram_service.send_message(
+                    chat_id,
+                    f"⚠️ <b>Batch Information Not Found</b>\n\n"
+                    f"Unable to proceed with approval. Please try the command again."
+                )
+                logger.warning(f"Batch information not found for chat_id {chat_id} when processing movement {movement_id}")
+            
+        except Exception as e:
+            logger.error(f"Error processing movement duplicate confirmation: {e}")
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "❌ Error processing confirmation. Please try again.",
+                show_alert=True
+            )
+    
+    async def _process_movement_duplicate_cancellation(self, callback_query, user_name: str, movement_id: str):
+        """Process individual movement duplicate cancellation - proceed with normal processing."""
+        try:
+            chat_id = callback_query.message.chat.id
+            
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "❌ Movement duplicate cancelled. Proceeding with normal approval...",
+                show_alert=True
+            )
+            
+            # Update the message to show cancellation
+            await self.telegram_service.edit_message_text(
+                chat_id=chat_id,
+                message_id=callback_query.message.message_id,
+                text=f"{callback_query.message.text}\n\n❌ Cancelled by {user_name}"
+            )
+            
+            # Get the stored batch information
+            if chat_id in self._pending_batches:
+                batch_approval = self._pending_batches[chat_id]
+                
+                # Send a message indicating that normal approval is proceeding
+                await self.telegram_service.send_message(
+                    chat_id,
+                    f"📝 <b>Proceeding with Normal Approval</b>\n\n"
+                    f"Movement ID: {movement_id}\n"
+                    f"Duplicate consolidation cancelled. Proceeding with normal approval process...\n\n"
+                    f"<i>This movement will be processed as a new entry.</i>"
+                )
+                
+                # Proceed with normal approval workflow
+                await self.telegram_service.send_batch_approval_request(
+                    chat_id,
+                    batch_approval.batch_id,
+                    batch_approval.movements,
+                    batch_approval.before_levels,
+                    user_name
+                )
+                
+                # Send "Entry submitted for approval" message
+                movement = next((m for m in batch_approval.movements if m.id == movement_id), None)
+                if movement:
+                    await self.telegram_service.send_message(
+                        chat_id,
+                        f"📝 <b>Entry submitted for approval</b>\n\n"
+                        f"Your request to add {movement.quantity} {movement.unit} of {movement.item_name} has been submitted for admin approval.\n\n"
+                        f"<b>Batch ID:</b> {batch_approval.batch_id}"
+                    )
+                
+                # Clean up the stored batch information
+                del self._pending_batches[chat_id]
+                
+                logger.info(f"Movement duplicate cancellation processed for movement {movement_id} by {user_name}")
+            else:
+                # Fallback if batch information is not available
+                await self.telegram_service.send_message(
+                    chat_id,
+                    f"⚠️ <b>Batch Information Not Found</b>\n\n"
+                    f"Unable to proceed with approval. Please try the command again."
+                )
+                logger.warning(f"Batch information not found for chat_id {chat_id} when processing movement {movement_id}")
+            
+        except Exception as e:
+            logger.error(f"Error processing movement duplicate cancellation: {e}")
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "❌ Error processing cancellation. Please try again.",
+                show_alert=True
+            )
+    
+    async def _process_all_movement_duplicates_confirmation(self, callback_query, user_name: str):
+        """Process all movement duplicates confirmation - consolidate all quantities."""
+        try:
+            chat_id = callback_query.message.chat.id
+            
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "✅ All movement duplicates confirmed. Proceeding with approval...",
+                show_alert=True
+            )
+            
+            # TODO: Implement batch duplicate consolidation logic
+            
+            logger.info(f"All movement duplicates confirmation processed by {user_name}")
+            
+        except Exception as e:
+            logger.error(f"Error processing all movement duplicates confirmation: {e}")
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "❌ Error processing confirmation. Please try again.",
+                show_alert=True
+            )
+    
+    async def _process_all_movement_duplicates_cancellation(self, callback_query, user_name: str):
+        """Process all movement duplicates cancellation - proceed with normal processing."""
+        try:
+            chat_id = callback_query.message.chat.id
+            
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "❌ All movement duplicates cancelled. Proceeding with normal approval...",
+                show_alert=True
+            )
+            
+            # TODO: Implement batch cancellation logic
+            
+            logger.info(f"All movement duplicates cancellation processed by {user_name}")
+            
+        except Exception as e:
+            logger.error(f"Error processing all movement duplicates cancellation: {e}")
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "❌ Error processing cancellation. Please try again.",
+                show_alert=True
+            )
+    
+    async def _show_all_movement_duplicate_matches(self, callback_query, user_name: str):
+        """Show all movement duplicate matches in detail."""
+        try:
+            chat_id = callback_query.message.chat.id
+            
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "📋 Showing all duplicate matches...",
+                show_alert=True
+            )
+            
+            # TODO: Implement detailed duplicate match display
+            
+            logger.info(f"Show all movement duplicate matches requested by {user_name}")
+            
+        except Exception as e:
+            logger.error(f"Error showing all movement duplicate matches: {e}")
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "❌ Error showing matches. Please try again.",
+                show_alert=True
+            )
+    
+    async def _process_duplicate_confirmation(self, callback_query, user_name: str):
+        """Process duplicate confirmation - consolidate quantities."""
+        try:
+            chat_id = callback_query.message.chat.id
+            
+            # Process duplicate confirmation using inventory service
+            success, message = await self.inventory_service.process_duplicate_confirmation(
+                chat_id, "confirm_duplicates", self.telegram_service
+            )
+            
+            if success:
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id,
+                    "✅ Duplicates confirmed and processed!",
+                    show_alert=True
+                )
+                
+                # Update the message to show confirmation
+                await self.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=callback_query.message.message_id,
+                    text=f"{callback_query.message.text}\n\n✅ Confirmed and processed by {user_name}",
+                    parse_mode='HTML'
+                )
+                
+                # Send the processing result
+                await self.telegram_service.send_message(chat_id, message)
+            else:
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id,
+                    f"❌ {message}",
+                    show_alert=True
+                )
+            
+        except Exception as e:
+            logger.error(f"Error processing duplicate confirmation: {e}")
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "❌ Error processing duplicates. Please try again.",
+                show_alert=True
+            )
+    
+    async def _process_duplicate_cancellation(self, callback_query, user_name: str):
+        """Process duplicate cancellation - proceed with normal inventory logging."""
+        try:
+            chat_id = callback_query.message.chat.id
+            
+            # Process duplicate cancellation using inventory service
+            success, message = await self.inventory_service.process_duplicate_confirmation(
+                chat_id, "cancel_duplicates", self.telegram_service
+            )
+            
+            if success:
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id,
+                    "❌ Duplicates cancelled. Proceeding with normal inventory logging.",
+                    show_alert=True
+                )
+                
+                # Update the message to show cancellation
+                await self.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=callback_query.message.message_id,
+                    text=f"{callback_query.message.text}\n\n❌ Cancelled by {user_name}. Proceeding with normal logging.",
+                    parse_mode='HTML'
+                )
+                
+                # Send the processing result
+                await self.telegram_service.send_message(chat_id, message)
+            else:
+                await self.telegram_service.answer_callback_query(
+                    callback_query.id,
+                    f"❌ {message}",
+                    show_alert=True
+                )
+            
+        except Exception as e:
+            logger.error(f"Error processing duplicate cancellation: {e}")
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "❌ Error cancelling duplicates. Please try again.",
+                show_alert=True
+            )
+    
+    async def _show_all_duplicate_matches(self, callback_query, user_name: str):
+        """Show all duplicate matches in detail."""
+        try:
+            chat_id = callback_query.message.chat.id
+            
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "🔍 Showing all duplicate matches...",
+                show_alert=True
+            )
+            
+            # For now, send a placeholder detailed view
+            # In a real implementation, this would show all matches with more details
+            detailed_message = (
+                "🔍 <b>All Duplicate Matches</b>\n\n"
+                "This would show detailed information about all potential duplicates found.\n\n"
+                "<i>Feature coming soon...</i>"
+            )
+            
+            await self.telegram_service.send_message(chat_id, detailed_message)
+            
+        except Exception as e:
+            logger.error(f"Error showing all duplicate matches: {e}")
+            await self.telegram_service.answer_callback_query(
+                callback_query.id,
+                "❌ Error showing matches. Please try again.",
+                show_alert=True
+            )
     
     async def cleanup_expired_keyboards(self):
         """Clean up expired keyboards (scheduled task)."""

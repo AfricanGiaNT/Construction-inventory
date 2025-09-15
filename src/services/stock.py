@@ -61,7 +61,7 @@ class StockService:
                 item_name=item_name,
                 movement_type=MovementType.IN,
                 quantity=quantity,
-                unit=unit or (item.base_unit if item else "piece"),
+                unit=unit or (item.unit_type if item else "piece"),
                 signed_base_quantity=base_quantity,
                 unit_size=item.unit_size if item else None,
                 unit_type=item.unit_type if item else None,
@@ -93,7 +93,7 @@ class StockService:
                 success_message = f"Stock in: {quantity} units × {item.unit_size} {item.unit_type} = {total_volume} {item.unit_type} of {item_name}{category_info} recorded successfully."
             else:
                 category_info = f" (Category: {item.category})" if item and item.category else ""
-                success_message = f"Stock in: {quantity} {unit or (item.base_unit if item else 'piece')} of {item_name}{category_info} recorded successfully."
+                success_message = f"Stock in: {quantity} {unit or (item.unit_type if item else 'piece')} of {item_name}{category_info} recorded successfully."
             
             return True, success_message, before_level, after_level
             
@@ -141,7 +141,7 @@ class StockService:
                         requested_volume = base_quantity * item.unit_size
                         error_message = f"Insufficient stock. Current: {item.on_hand} units × {item.unit_size} {item.unit_type} = {current_volume} {item.unit_type}, Requested: {base_quantity} units × {item.unit_size} {item.unit_type} = {requested_volume} {item.unit_type}. Admin approval required for negative stock."
                     else:
-                        error_message = f"Insufficient stock. Current: {item.on_hand} {item.base_unit}, Requested: {base_quantity} {item.base_unit}. Admin approval required for negative stock."
+                        error_message = f"Insufficient stock. Current: {item.on_hand} {item.unit_type}, Requested: {base_quantity} {item.unit_type}. Admin approval required for negative stock."
                     
                     return False, error_message, None, before_level, after_level
                 else:
@@ -168,7 +168,7 @@ class StockService:
                 item_name=item_name,
                 movement_type=MovementType.OUT,
                 quantity=quantity,
-                unit=unit or item.base_unit,
+                unit=unit or item.unit_type,
                 signed_base_quantity=-base_quantity,  # Negative for out
                 unit_size=item.unit_size,
                 unit_type=item.unit_type,
@@ -178,7 +178,7 @@ class StockService:
                 user_id=str(user_id),
                 user_name=user_name,
                 timestamp=datetime.now(UTC),
-                reason="Issue",
+                reason="Purchase",
                 driver_name=driver_name,
                 from_location=from_location,
                 project=project,
@@ -199,7 +199,7 @@ class StockService:
                 success_message = f"Stock out request submitted for approval: {quantity} units × {item.unit_size} {item.unit_type} = {total_volume} {item.unit_type} of {item_name}{category_info}. Movement ID: {movement_id}"
             else:
                 category_info = f" (Category: {item.category})" if item.category else ""
-                success_message = f"Stock out request submitted for approval: {quantity} {unit or item.base_unit} of {item_name}{category_info}. Movement ID: {movement_id}"
+                success_message = f"Stock out request submitted for approval: {quantity} {unit or item.unit_type} of {item_name}{category_info}. Movement ID: {movement_id}"
             
             return True, success_message, movement_id, before_level, after_level
                 
@@ -248,7 +248,7 @@ class StockService:
                 item_name=item_name,
                 movement_type=MovementType.ADJUST,
                 quantity=quantity,
-                unit=unit or item.base_unit,
+                unit=unit or item.unit_type,
                 signed_base_quantity=base_quantity,
                 unit_size=item.unit_size,
                 unit_type=item.unit_type,
@@ -277,7 +277,7 @@ class StockService:
                 success_message = f"Stock adjustment request submitted for approval: {quantity} units × {item.unit_size} {item.unit_type} = {total_volume} {item.unit_type} of {item_name}{category_info}."
             else:
                 category_info = f" (Category: {item.category})" if item.category else ""
-                success_message = f"Stock adjustment request submitted for approval: {quantity} {unit or item.base_unit} of {item_name}{category_info}."
+                success_message = f"Stock adjustment request submitted for approval: {quantity} {unit or item.unit_type} of {item_name}{category_info}."
             
             return True, success_message, before_level, after_level
             
@@ -318,7 +318,7 @@ class StockService:
     async def _convert_to_base_quantity(self, item: Item, quantity: float, 
                                       unit: Optional[str]) -> float:
         """Convert quantity to base unit."""
-        if not unit or unit == item.base_unit:
+        if not unit or unit == item.unit_type:
             return quantity
         
         # TODO: Implement unit conversion logic using Item Units table
@@ -349,7 +349,7 @@ class StockService:
                 total_volume = item.get_total_volume()
                 stock_message = f"Current stock: {item.on_hand} units × {item.unit_size} {item.unit_type} = {total_volume} {item.unit_type}"
             else:
-                stock_message = f"Current stock: {item.on_hand} {item.base_unit}"
+                stock_message = f"Current stock: {item.on_hand} {item.unit_type}"
             
             return True, stock_message, item
             
@@ -371,7 +371,7 @@ class StockService:
                     total_volume = item.get_total_volume()
                     enhanced_items.append(f"{item.name}: {item.on_hand} units × {item.unit_size} {item.unit_type} = {total_volume} {item.unit_type}")
                 else:
-                    enhanced_items.append(f"{item.name}: {item.on_hand} {item.base_unit}")
+                    enhanced_items.append(f"{item.name}: {item.on_hand} {item.unit_type}")
             
             return True, f"Found {len(items)} items matching '{query}'", items
             

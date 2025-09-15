@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from schemas import Item
 from services.category_parser import category_parser
 from services.smart_unit_converter import smart_unit_converter
+from services.duplicate_detection import DuplicateDetectionService, DuplicateDetectionResult
 
 logger = logging.getLogger(__name__)
 
@@ -338,13 +339,14 @@ class InventoryParser:
 class InventoryService:
     """Service for processing inventory stocktake operations."""
 
-    def __init__(self, airtable_client, settings, audit_trail_service=None, persistent_idempotency_service=None):
+    def __init__(self, airtable_client, settings, audit_trail_service=None, persistent_idempotency_service=None, duplicate_detection_service=None):
         """Initialize the inventory service."""
         self.airtable = airtable_client
         self.settings = settings
         self.parser = InventoryParser()
         self.audit_trail_service = audit_trail_service
         self.persistent_idempotency_service = persistent_idempotency_service
+        self.duplicate_detection_service = duplicate_detection_service or DuplicateDetectionService(airtable_client)
 
     def _extract_unit_info_from_name(self, item_name: str) -> Tuple[float, str]:
         """
@@ -381,7 +383,7 @@ class InventoryService:
             return 1.0, "piece"
 
     async def process_inventory_stocktake(self, command_text: str, user_id: int, user_name: str, 
-                                       validate_only: bool = False) -> Tuple[bool, str]:
+                                       validate_only: bool = False, telegram_service=None, chat_id: int = None) -> Tuple[bool, str]:
         """
         Process an inventory stocktake command.
 
@@ -433,6 +435,19 @@ class InventoryService:
             if validate_only:
                 # Return validation report without processing
                 return True, self._generate_validation_report(parse_result)
+
+            # Check for duplicates if telegram_service and chat_id are provided
+            if telegram_service and chat_id is not None:
+                duplicate_result = await self._check_for_duplicates(parse_result.entries, user_name)
+                if duplicate_result.has_duplicates:
+                    # Send duplicate confirmation dialog
+                    message_id = await telegram_service.send_duplicate_confirmation(
+                        chat_id, duplicate_result.potential_duplicates, parse_result.entries
+                    )
+                    if message_id > 0:
+                        # Store the duplicate data for later processing
+                        await self._store_duplicate_data(chat_id, duplicate_result, parse_result, user_id, user_name)
+                        return True, "duplicate_detection_sent"  # Special return value to indicate duplicate detection was sent
 
             # Generate batch ID for audit trail
             batch_id = None
@@ -791,6 +806,446 @@ class InventoryService:
                 
                 if len(enhanced_items) > 3:
                     summary += f"... and {len(enhanced_items) - 3} more enhanced items\n"
+        
+        if batch_id and self.audit_trail_service:
+            summary += f"\n📋 <b>Audit Trail:</b> Created for all successful entries (Batch: {batch_id})"
+
+        return summary
+
+    async def _check_for_duplicates(self, entries: List[InventoryEntry], user_name: str) -> DuplicateDetectionResult:
+        """
+        Check for potential duplicates in the inventory entries.
+        
+        Args:
+            entries: List of inventory entries to check
+            user_name: Name of the user performing the inventory
+            
+        Returns:
+            DuplicateDetectionResult with duplicate information
+        """
+        try:
+            all_duplicates = []
+            new_entries = []
+            
+            for entry in entries:
+                # Check for duplicates for this entry
+                duplicates = await self.duplicate_detection_service.find_potential_duplicates(
+                    entry.item_name, entry.quantity
+                )
+                
+                if duplicates:
+                    all_duplicates.extend(duplicates)
+                    new_entries.append(entry)
+            
+            # Create result
+            result = DuplicateDetectionResult(
+                has_duplicates=len(all_duplicates) > 0,
+                potential_duplicates=all_duplicates,
+                new_entries=new_entries,
+                requires_confirmation=len(all_duplicates) > 0
+            )
+            
+            logger.info(f"Duplicate detection found {len(all_duplicates)} potential duplicates for {len(new_entries)} entries")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error checking for duplicates: {e}")
+            # Return empty result on error
+            return DuplicateDetectionResult(
+                has_duplicates=False,
+                potential_duplicates=[],
+                new_entries=[],
+                requires_confirmation=False
+            )
+
+    async def _store_duplicate_data(self, chat_id: int, duplicate_result: DuplicateDetectionResult, 
+                                  parse_result: InventoryParseResult, user_id: int, user_name: str):
+        """
+        Store duplicate data for later processing when user confirms.
+        
+        Args:
+            chat_id: Telegram chat ID
+            duplicate_result: Result from duplicate detection
+            parse_result: Parsed inventory command result
+            user_id: User ID
+            user_name: User name
+        """
+        try:
+            # In a real implementation, this would store the data in a persistent store
+            # For now, we'll use a simple in-memory store
+            if not hasattr(self, '_pending_duplicates'):
+                self._pending_duplicates = {}
+            
+            self._pending_duplicates[chat_id] = {
+                'duplicate_result': duplicate_result,
+                'parse_result': parse_result,
+                'user_id': user_id,
+                'user_name': user_name,
+                'timestamp': datetime.now()
+            }
+            
+            logger.info(f"Stored duplicate data for chat {chat_id} with {len(duplicate_result.potential_duplicates)} duplicates")
+            
+        except Exception as e:
+            logger.error(f"Error storing duplicate data: {e}")
+
+    async def process_duplicate_confirmation(self, chat_id: int, action: str, telegram_service=None) -> Tuple[bool, str]:
+        """
+        Process duplicate confirmation action.
+        
+        Args:
+            chat_id: Telegram chat ID
+            action: Action taken (confirm_duplicates, cancel_duplicates)
+            telegram_service: Telegram service for sending messages
+            
+        Returns:
+            Tuple of (success, message)
+        """
+        try:
+            # Get stored duplicate data
+            if not hasattr(self, '_pending_duplicates') or chat_id not in self._pending_duplicates:
+                return False, "No pending duplicate data found for this chat."
+            
+            duplicate_data = self._pending_duplicates[chat_id]
+            duplicate_result = duplicate_data['duplicate_result']
+            parse_result = duplicate_data['parse_result']
+            user_id = duplicate_data['user_id']
+            user_name = duplicate_data['user_name']
+            
+            if action == "confirm_duplicates":
+                # Process duplicates by consolidating quantities
+                return await self._process_duplicate_consolidation(
+                    duplicate_result, parse_result, user_id, user_name, telegram_service, chat_id
+                )
+            elif action == "cancel_duplicates":
+                # Process normally without duplicate consolidation
+                return await self._process_normal_inventory(
+                    parse_result, user_id, user_name, telegram_service, chat_id
+                )
+            else:
+                return False, f"Unknown action: {action}"
+                
+        except Exception as e:
+            logger.error(f"Error processing duplicate confirmation: {e}")
+            return False, f"Error processing duplicate confirmation: {str(e)}"
+
+    async def _process_duplicate_consolidation(self, duplicate_result: DuplicateDetectionResult, 
+                                             parse_result: InventoryParseResult, user_id: int, 
+                                             user_name: str, telegram_service=None, chat_id: int = None) -> Tuple[bool, str]:
+        """
+        Process duplicate consolidation by updating existing items.
+        
+        Args:
+            duplicate_result: Duplicate detection result
+            parse_result: Parsed inventory command result
+            user_id: User ID
+            user_name: User name
+            telegram_service: Telegram service for sending messages
+            chat_id: Telegram chat ID
+            
+        Returns:
+            Tuple of (success, message)
+        """
+        try:
+            # Generate batch ID for audit trail
+            batch_id = None
+            if self.audit_trail_service:
+                batch_id = self.audit_trail_service.generate_batch_id()
+
+            # Process each entry with duplicate consolidation
+            results = []
+            updated_items = 0
+            created_items = 0
+            failed_items = 0
+            consolidated_items = []
+
+            for entry in parse_result.entries:
+                # Check if this entry has duplicates
+                entry_duplicates = [d for d in duplicate_result.potential_duplicates 
+                                  if self._entries_similar(entry, d)]
+                
+                if entry_duplicates:
+                    # Consolidate with existing items
+                    result = await self._consolidate_with_duplicates(
+                        entry, entry_duplicates, parse_result.header.normalized_date, 
+                        user_name, parse_result.header.category
+                    )
+                    consolidated_items.append(entry.item_name)
+                else:
+                    # Process normally
+                    result = await self._process_inventory_entry(
+                        entry, parse_result.header.normalized_date, user_name, parse_result.header.category
+                    )
+                
+                results.append(result)
+
+                if result["success"]:
+                    if result["created"]:
+                        created_items += 1
+                    else:
+                        updated_items += 1
+                else:
+                    failed_items += 1
+
+            # Create audit trail records for successful entries
+            if self.audit_trail_service and batch_id:
+                try:
+                    audit_records = await self.audit_trail_service.create_audit_records(
+                        batch_id=batch_id,
+                        date=parse_result.header.normalized_date,
+                        logged_by=parse_result.header.logged_by,
+                        entries=results,
+                        user_name=user_name
+                    )
+                    logger.info(f"Created {len(audit_records)} audit records for batch {batch_id}")
+                except Exception as e:
+                    logger.error(f"Failed to create audit trail: {e}")
+
+            # Generate summary message
+            summary = self._generate_duplicate_consolidation_summary(
+                parse_result.header, updated_items, created_items, failed_items, 
+                results, batch_id, parse_result, consolidated_items
+            )
+
+            # Clean up stored duplicate data
+            if hasattr(self, '_pending_duplicates') and chat_id in self._pending_duplicates:
+                del self._pending_duplicates[chat_id]
+
+            return True, summary
+
+        except Exception as e:
+            logger.error(f"Error processing duplicate consolidation: {e}")
+            return False, f"Error processing duplicate consolidation: {str(e)}"
+
+    async def _process_normal_inventory(self, parse_result: InventoryParseResult, user_id: int, 
+                                      user_name: str, telegram_service=None, chat_id: int = None) -> Tuple[bool, str]:
+        """
+        Process inventory normally without duplicate consolidation.
+        
+        Args:
+            parse_result: Parsed inventory command result
+            user_id: User ID
+            user_name: User name
+            telegram_service: Telegram service for sending messages
+            chat_id: Telegram chat ID
+            
+        Returns:
+            Tuple of (success, message)
+        """
+        try:
+            # Generate batch ID for audit trail
+            batch_id = None
+            if self.audit_trail_service:
+                batch_id = self.audit_trail_service.generate_batch_id()
+
+            # Process each entry normally
+            results = []
+            updated_items = 0
+            created_items = 0
+            failed_items = 0
+
+            for entry in parse_result.entries:
+                result = await self._process_inventory_entry(
+                    entry, parse_result.header.normalized_date, user_name, parse_result.header.category
+                )
+                results.append(result)
+
+                if result["success"]:
+                    if result["created"]:
+                        created_items += 1
+                    else:
+                        updated_items += 1
+                else:
+                    failed_items += 1
+
+            # Create audit trail records for successful entries
+            if self.audit_trail_service and batch_id:
+                try:
+                    audit_records = await self.audit_trail_service.create_audit_records(
+                        batch_id=batch_id,
+                        date=parse_result.header.normalized_date,
+                        logged_by=parse_result.header.logged_by,
+                        entries=results,
+                        user_name=user_name
+                    )
+                    logger.info(f"Created {len(audit_records)} audit records for batch {batch_id}")
+                except Exception as e:
+                    logger.error(f"Failed to create audit trail: {e}")
+
+            # Generate summary message
+            summary = self._generate_summary(
+                parse_result.header, updated_items, created_items, failed_items, 
+                results, batch_id, parse_result
+            )
+
+            # Clean up stored duplicate data
+            if hasattr(self, '_pending_duplicates') and chat_id in self._pending_duplicates:
+                del self._pending_duplicates[chat_id]
+
+            return True, summary
+
+        except Exception as e:
+            logger.error(f"Error processing normal inventory: {e}")
+            return False, f"Error processing normal inventory: {str(e)}"
+
+    def _entries_similar(self, entry: InventoryEntry, duplicate) -> bool:
+        """
+        Check if an inventory entry is similar to a potential duplicate.
+        
+        Args:
+            entry: Inventory entry
+            duplicate: Potential duplicate
+            
+        Returns:
+            True if entries are similar
+        """
+        try:
+            # Use the duplicate detection service's similarity check
+            similarity = self.duplicate_detection_service._calculate_duplicate_similarity(
+                entry.item_name, duplicate.item_name
+            )
+            return similarity >= self.duplicate_detection_service.similarity_threshold
+        except Exception as e:
+            logger.error(f"Error checking entry similarity: {e}")
+            return False
+
+    async def _consolidate_with_duplicates(self, entry: InventoryEntry, duplicates: List, 
+                                         normalized_date: str, user_name: str, 
+                                         category_override: Optional[str] = None) -> Dict:
+        """
+        Consolidate an inventory entry with its duplicates.
+        
+        Args:
+            entry: Inventory entry to consolidate
+            duplicates: List of potential duplicates
+            normalized_date: Normalized date string
+            user_name: User name
+            category_override: Optional category override
+            
+        Returns:
+            Dictionary with consolidation result
+        """
+        try:
+            # Find the best matching duplicate (highest similarity score)
+            best_duplicate = max(duplicates, key=lambda d: d.similarity_score)
+            
+            # Get the existing item
+            existing_item = await self.airtable.get_item(best_duplicate.item_name)
+            if not existing_item:
+                # Fall back to normal processing if item not found
+                return await self._process_inventory_entry(
+                    entry, normalized_date, user_name, category_override
+                )
+            
+            # Store previous quantity for audit trail
+            previous_quantity = existing_item.on_hand
+            
+            # Add the new quantity to existing stock
+            success = await self._update_item_stock(
+                best_duplicate.item_name, entry.quantity, existing_item, normalized_date, user_name
+            )
+            
+            if success:
+                new_total = previous_quantity + entry.quantity
+                return {
+                    "success": True,
+                    "created": False,
+                    "item_name": best_duplicate.item_name,
+                    "quantity": entry.quantity,
+                    "previous_quantity": previous_quantity,
+                    "new_total": new_total,
+                    "message": f"Consolidated {entry.item_name} with {best_duplicate.item_name}: +{entry.quantity} (was {previous_quantity}, now {new_total})"
+                }
+            else:
+                return {
+                    "success": False,
+                    "created": False,
+                    "item_name": best_duplicate.item_name,
+                    "quantity": entry.quantity,
+                    "previous_quantity": previous_quantity,
+                    "message": f"Failed to consolidate {entry.item_name} with {best_duplicate.item_name}"
+                }
+                
+        except Exception as e:
+            logger.error(f"Error consolidating with duplicates: {e}")
+            return {
+                "success": False,
+                "created": False,
+                "item_name": entry.item_name,
+                "quantity": entry.quantity,
+                "previous_quantity": 0.0,
+                "message": f"Error consolidating: {str(e)}"
+            }
+
+    def _generate_duplicate_consolidation_summary(self, header: InventoryHeader, updated_items: int, 
+                                                created_items: int, failed_items: int, results: List[Dict], 
+                                                batch_id: Optional[str], parse_result: InventoryParseResult,
+                                                consolidated_items: List[str]) -> str:
+        """
+        Generate summary message for duplicate consolidation processing.
+        
+        Args:
+            header: Inventory header
+            updated_items: Number of updated items
+            created_items: Number of created items
+            failed_items: Number of failed items
+            results: List of processing results
+            batch_id: Batch ID for audit trail
+            parse_result: Parsed inventory command result
+            consolidated_items: List of consolidated item names
+            
+        Returns:
+            Formatted summary message
+        """
+        summary = f"✅ <b>Inventory Processing Complete (Duplicate Consolidation)</b>\n\n"
+        summary += f"<b>Date:</b> {header.date} (normalized to {header.normalized_date})\n"
+        summary += f"<b>Logged by:</b> {', '.join(header.logged_by)}\n"
+        if header.category:
+            summary += f"<b>Category Override:</b> {header.category}\n"
+        
+        summary += f"\n📊 <b>Processing Results:</b>\n"
+        summary += f"• Updated Items: {updated_items}\n"
+        summary += f"• Created Items: {created_items}\n"
+        summary += f"• Failed Items: {failed_items}\n"
+        summary += f"• Consolidated Items: {len(consolidated_items)}\n"
+        
+        if consolidated_items:
+            summary += f"\n🔄 <b>Consolidated Items:</b>\n"
+            for item in consolidated_items[:5]:  # Show first 5
+                summary += f"• {item}\n"
+            if len(consolidated_items) > 5:
+                summary += f"• ... and {len(consolidated_items) - 5} more\n"
+        
+        # Add statistics about ignored lines if available
+        if parse_result and (parse_result.blank_lines > 0 or parse_result.comment_lines > 0):
+            summary += f"\n📊 <b>Lines Processed:</b>\n"
+            if parse_result.blank_lines > 0:
+                summary += f"• {parse_result.blank_lines} blank lines ignored\n"
+            if parse_result.comment_lines > 0:
+                summary += f"• {parse_result.comment_lines} comment lines ignored\n"
+            if parse_result.skipped_lines > 0:
+                summary += f"• {parse_result.skipped_lines} invalid lines skipped\n"
+
+        # Show consolidation updates
+        if updated_items > 0:
+            updated_results = [r for r in results if r.get("success") and not r.get("created")]
+            if updated_results:
+                summary += f"\n📈 <b>Consolidation Updates:</b>\n"
+                for result in updated_results[:5]:  # Show first 5 updates
+                    item_name = result.get("item_name", "Unknown")
+                    quantity_added = result.get("quantity", 0)
+                    previous_qty = result.get("previous_quantity", 0)
+                    new_total = result.get("new_total", previous_qty + quantity_added)
+                    summary += f"• {item_name}: +{quantity_added} (was {previous_qty}, now {new_total})\n"
+                
+                if len(updated_results) > 5:
+                    summary += f"• ... and {len(updated_results) - 5} more items\n"
+
+        if failed_items > 0:
+            summary += f"\n❌ <b>Failed Items:</b>\n"
+            for result in results:
+                if not result["success"]:
+                    summary += f"• {result['item_name']}: {result['message']}\n"
         
         if batch_id and self.audit_trail_service:
             summary += f"\n📋 <b>Audit Trail:</b> Created for all successful entries (Batch: {batch_id})"

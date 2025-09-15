@@ -292,13 +292,50 @@ class CategoryParser:
                 descriptive_words.append(word)
         
         if descriptive_words:
-            # Use the first descriptive word as the category
-            new_category = descriptive_words[0].title()
-            logger.info(f"Created new category '{new_category}' for item '{item_name}'")
-            return new_category
+            # Map common brand names and abbreviations to valid categories
+            first_word = descriptive_words[0].lower()
+            brand_mappings = {
+                'cat': 'Tools',  # CAT (Caterpillar) equipment
+                'bosch': 'Tools',
+                'dewalt': 'Tools',
+                'makita': 'Tools',
+                'stanley': 'Tools',
+                'black': 'Paint',
+                'white': 'Paint',
+                'red': 'Paint',
+                'blue': 'Paint',
+                'green': 'Paint',
+                'yellow': 'Paint',
+                'filter': 'Tools',
+                'hydraulic': 'Tools',
+                'pneumatic': 'Tools',
+                'electric': 'Electrical',
+                'cable': 'Electrical',
+                'wire': 'Electrical',
+                'steel': 'Steel',
+                'iron': 'Steel',
+                'aluminum': 'Steel',
+                'concrete': 'Construction Materials',
+                'cement': 'Construction Materials',
+                'brick': 'Construction Materials',
+                'tile': 'Construction Materials',
+                'wood': 'Carpentry',
+                'timber': 'Carpentry',
+                'plywood': 'Carpentry'
+            }
+            
+            # Check if the first word maps to a valid category
+            if first_word in brand_mappings:
+                new_category = brand_mappings[first_word]
+                logger.info(f"Using mapped category '{new_category}' for item '{item_name}' (mapped from '{first_word}')")
+                return new_category
+            else:
+                # Use General category instead of creating new ones to avoid permission issues
+                logger.info(f"Using General category for item '{item_name}' (would have created '{descriptive_words[0].title()}')")
+                return "General"
         
-        # Fallback to generic category
-        return "Other"
+        # Fallback to generic category (use existing category to avoid permission issues)
+        return "General"
     
     def get_all_categories(self) -> List[str]:
         """

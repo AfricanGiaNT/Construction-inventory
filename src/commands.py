@@ -33,7 +33,9 @@ class CommandParser:
             "performance_test": r"^/performance\s+test$",  # Run performance tests
             "system_health": r"^/system\s+health$",  # System health check
             "inventory_validate": r"^/inventory\s+validate\s+([\s\S]+)$",  # Must come before inventory
-            "inventory": r"^/inventory\s+([\s\S]+)$"  # Captures everything after /inventory including newlines
+            "inventory": r"^/inventory\s+([\s\S]+)$",  # Captures everything after /inventory including newlines
+            "preview_in": r"^/preview\s+in\s+([\s\S]+)$",  # Preview IN command duplicates
+            "preview_out": r"^/preview\s+out\s+([\s\S]+)$"  # Preview OUT command duplicates
         }
         
         # Initialize NLP parser

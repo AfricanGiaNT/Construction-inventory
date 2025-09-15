@@ -1,0 +1,554 @@
+# Duplicate Detection Feature Implementation Plan
+
+## **📋 Project Overview**
+
+Add intelligent duplicate detection to the `/inventory` command to prevent misleading inventory data by detecting similar entries before logging and allowing users to confirm or cancel with quantity updates.
+
+**Status**: PLANNING PHASE  
+**Current Progress**: 0 of 4 phases (0% complete)  
+**Target Completion**: Duplicate detection with confirmation flow and quantity updates
+
+## **🎯 Business Objectives**
+
+### **Primary Goals**
+- **Prevent Duplicate Logging**: Detect similar inventory entries before they're logged
+- **Maintain Data Integrity**: Ensure accurate inventory counts by consolidating duplicates
+- **Improve User Experience**: Provide clear confirmation dialogs with preview of changes
+- **Reduce Manual Cleanup**: Automatically handle quantity updates for similar items
+
+### **Success Metrics**
+- **Duplicate Detection Rate**: 95%+ accuracy in detecting similar entries
+- **User Confirmation Rate**: 80%+ of detected duplicates properly handled
+- **Data Accuracy**: 100% of confirmed duplicates properly consolidated
+- **Performance Impact**: <500ms additional processing time per inventory batch
+
+## **🏗️ System Architecture**
+
+### **Core Components**
+- **`DuplicateDetectionService`**: Main service for detecting potential duplicates
+- **Enhanced Similarity Algorithm**: Word-level matching with up to 1 missing keyword
+- **Confirmation Flow**: Telegram inline keyboard for user decisions
+- **Quantity Consolidation**: Automatic addition of quantities for confirmed duplicates
+
+### **Integration Points**
+- **`InventoryService`**: Modified to include duplicate detection step
+- **`TelegramService`**: New methods for confirmation dialogs
+- **Callback Query Handler**: New handlers for confirm/cancel actions
+
+## **📅 Implementation Phases**
+
+### **Phase 1: Core Duplicate Detection Engine** ⏳
+**Duration**: 3-4 days  
+**Status**: PLANNING
+
+#### **Objectives**
+- Implement `DuplicateDetectionService` with enhanced similarity algorithm
+- Create data structures for potential duplicates
+- Add caching for performance optimization
+- Implement word-level matching with keyword extraction
+
+#### **Technical Implementation**
+```python
+# Location: src/services/duplicate_detection.py
+@dataclass
+class PotentialDuplicate:
+    item_name: str
+    quantity: float
+    unit: str
+    similarity_score: float
+    movement_id: str
+    timestamp: datetime
+    location: Optional[str]
+    category: Optional[str]
+    user_name: str
+
+@dataclass
+class DuplicateDetectionResult:
+    has_duplicates: bool
+    potential_duplicates: List[PotentialDuplicate]
+    new_entries: List[InventoryEntry]
+    requires_confirmation: bool
+
+class DuplicateDetectionService:
+    def __init__(self, airtable_client: AirtableClient):
+        self.airtable = airtable_client
+        self.similarity_threshold = 0.7
+        self.cache_ttl = timedelta(minutes=30)
+        self._cache = {}
+    
+    async def find_potential_duplicates(self, item_name: str, quantity: float) -> List[PotentialDuplicate]:
+        """Find potential duplicates for a given item."""
+        pass
+    
+    def _calculate_duplicate_similarity(self, new_item: str, existing_item: str) -> float:
+        """Enhanced similarity algorithm for duplicate detection."""
+        pass
+    
+    def _extract_keywords(self, text: str) -> List[str]:
+        """Extract meaningful keywords from item names."""
+        pass
+    
+    def _normalize_quantity(self, text: str) -> Tuple[float, str]:
+        """Extract and normalize quantity and unit from text."""
+        pass
+```
+
+#### **Enhanced Similarity Algorithm**
+```python
+def _calculate_duplicate_similarity(self, new_item: str, existing_item: str) -> float:
+    """
+    Calculate similarity for duplicate detection.
+    - Higher threshold (0.7) than search (0.5)
+    - Exact keyword matching with up to 1 missing keyword
+    - Order independence: "50kgs bags cement" matches "cement 50kgs bags"
+    - No partial word matches, only exact word matches
+    """
+    # Normalize text
+    new_normalized = self._normalize_text(new_item)
+    existing_normalized = self._normalize_text(existing_item)
+    
+    # Extract keywords (ignore common words)
+    new_keywords = self._extract_keywords(new_normalized)
+    existing_keywords = self._extract_keywords(existing_normalized)
+    
+    # Extract quantities separately
+    new_qty, new_unit = self._normalize_quantity(new_item)
+    existing_qty, existing_unit = self._normalize_quantity(existing_item)
+    
+    # Check exact keyword matches
+    exact_matches = len(set(new_keywords) & set(existing_keywords))
+    total_keywords = len(new_keywords)
+    
+    # Allow up to 1 missing keyword
+    if exact_matches >= total_keywords - 1:
+        # Check quantity similarity (must be same or very close)
+        if self._quantities_similar(new_qty, existing_qty):
+            return 0.7 + (exact_matches / total_keywords) * 0.3
+    
+    return 0.0
+```
+
+#### **Test Scenarios**
+```python
+# Test Phase 1: Duplicate Detection Engine
+def test_phase1_duplicate_detection():
+    """Test core duplicate detection functionality."""
+    
+    # Test exact keyword matching
+    assert service._calculate_duplicate_similarity("Cement 32.5", "32.5 Cement") >= 0.7
+    assert service._calculate_duplicate_similarity("50kgs bags cement", "cement 50kgs bags") >= 0.7
+    
+    # Test missing keyword tolerance
+    assert service._calculate_duplicate_similarity("Cement 32.5", "Cement 32.5 Grade") >= 0.7
+    assert service._calculate_duplicate_similarity("Cement 32.5", "Cement") < 0.7
+    
+    # Test quantity similarity
+    assert service._quantities_similar(50.0, 50.0) == True
+    assert service._quantities_similar(50.0, 45.0) == True  # Close quantities
+    assert service._quantities_similar(50.0, 20.0) == False  # Different quantities
+    
+    # Test keyword extraction
+    keywords = service._extract_keywords("Cement 32.5 Grade 50kgs")
+    assert "cement" in keywords
+    assert "32.5" in keywords
+    assert "grade" in keywords
+    assert "50kgs" in keywords
+```
+
+#### **Deliverables**
+- [ ] `DuplicateDetectionService` class with core functionality
+- [ ] Enhanced similarity algorithm implementation
+- [ ] Data structures for potential duplicates
+- [ ] Caching mechanism for performance
+- [ ] Unit tests (25+ test methods)
+
+### **Phase 2: Telegram Integration & Confirmation Flow** ⏳
+**Duration**: 2-3 days  
+**Status**: PLANNING
+
+#### **Objectives**
+- Add confirmation dialog methods to `TelegramService`
+- Implement inline keyboard for confirm/cancel actions
+- Create callback query handlers for user decisions
+- Design user-friendly preview messages
+
+#### **Technical Implementation**
+```python
+# Location: src/telegram_service.py (additions)
+class TelegramService:
+    async def send_duplicate_confirmation(self, chat_id: int, 
+                                        duplicates: List[PotentialDuplicate], 
+                                        new_entries: List[InventoryEntry]) -> int:
+        """Send duplicate confirmation dialog with inline keyboard."""
+        message = self._format_duplicate_message(duplicates, new_entries)
+        keyboard = self._create_confirmation_keyboard()
+        return await self.send_message(chat_id, message, reply_markup=keyboard)
+    
+    def _format_duplicate_message(self, duplicates: List[PotentialDuplicate], 
+                                new_entries: List[InventoryEntry]) -> str:
+        """Format duplicate detection message with preview."""
+        pass
+    
+    def _create_confirmation_keyboard(self) -> InlineKeyboardMarkup:
+        """Create inline keyboard for confirmation actions."""
+        pass
+
+# Location: src/main.py (additions)
+class ConstructionInventoryBot:
+    async def handle_duplicate_confirmation(self, callback_query, action: str):
+        """Handle user's duplicate confirmation decision."""
+        if action == "confirm_duplicates":
+            await self._process_duplicate_confirmation(callback_query)
+        elif action == "cancel_duplicates":
+            await self._process_duplicate_cancellation(callback_query)
+        elif action == "show_all_matches":
+            await self._show_all_duplicate_matches(callback_query)
+```
+
+#### **User Experience Flow**
+```
+🔍 <b>Potential Duplicates Detected</b>
+
+Found similar entries that might be duplicates:
+
+<b>New Entry:</b> Cement 32.5, 50
+<b>Similar to:</b>
+• Cement 32.5, 45 (95% match) - Added 2 days ago by John
+• 32.5 Cement, 50 (98% match) - Added 1 week ago by Sarah
+
+<b>New Entry:</b> 12mm rebar, 120.0
+<b>Similar to:</b>
+• 12mm rebar, 100.0 (92% match) - Added 3 days ago by Mike
+
+<b>Action Required:</b>
+Choose how to proceed with these entries.
+
+[✅ Confirm & Update] [❌ Cancel & Check Stock] [�� Show All Matches]
+```
+
+#### **Test Scenarios**
+```python
+# Test Phase 2: Telegram Integration
+def test_phase2_telegram_integration():
+    """Test confirmation flow and user interface."""
+    
+    # Test message formatting
+    message = telegram_service._format_duplicate_message(duplicates, new_entries)
+    assert "Potential Duplicates Detected" in message
+    assert "Confirm & Update" in message
+    
+    # Test keyboard creation
+    keyboard = telegram_service._create_confirmation_keyboard()
+    assert len(keyboard.inline_keyboard) == 1
+    assert len(keyboard.inline_keyboard[0]) == 3
+    
+    # Test callback handling
+    # Test confirm action
+    # Test cancel action
+    # Test show all matches action
+```
+
+#### **Deliverables**
+- [ ] Confirmation dialog methods in `TelegramService`
+- [ ] Inline keyboard implementation
+- [ ] Callback query handlers
+- [ ] User-friendly message formatting
+- [ ] Integration tests (15+ test methods)
+
+### **Phase 3: Inventory Service Integration** ⏳
+**Duration**: 2-3 days  
+**Status**: PLANNING
+
+#### **Objectives**
+- Modify `InventoryService.process_inventory_command()` to include duplicate detection
+- Implement quantity consolidation logic
+- Handle user confirmation flow
+- Update existing entries with new quantities
+
+#### **Technical Implementation**
+```python
+# Location: src/services/inventory.py (modifications)
+class InventoryService:
+    def __init__(self, airtable_client: AirtableClient, settings):
+        self.airtable = airtable_client
+        self.settings = settings
+        self.duplicate_detector = DuplicateDetectionService(airtable_client)
+    
+    async def process_inventory_command(self, command_text: str, user_id: int, 
+                                      user_name: str, chat_id: int) -> Dict:
+        """Enhanced inventory processing with duplicate detection."""
+        # Parse command
+        parse_result = self.parser.parse_inventory_command(command_text)
+        
+        if not parse_result.is_valid:
+            return {"success": False, "message": "Invalid command format"}
+        
+        # Check for duplicates
+        duplicate_result = await self._check_for_duplicates(parse_result.entries)
+        
+        if duplicate_result.has_duplicates:
+            # Send confirmation dialog
+            message_id = await self.telegram_service.send_duplicate_confirmation(
+                chat_id, duplicate_result.potential_duplicates, parse_result.entries
+            )
+            # Store pending confirmation state
+            await self._store_pending_confirmation(chat_id, message_id, duplicate_result)
+            return {"success": True, "requires_confirmation": True}
+        
+        # Process normally if no duplicates
+        return await self._process_normal_inventory(parse_result, user_id, user_name)
+    
+    async def _check_for_duplicates(self, entries: List[InventoryEntry]) -> DuplicateDetectionResult:
+        """Check all entries for potential duplicates."""
+        all_duplicates = []
+        has_duplicates = False
+        
+        for entry in entries:
+            duplicates = await self.duplicate_detector.find_potential_duplicates(
+                entry.item_name, entry.quantity
+            )
+            if duplicates:
+                all_duplicates.extend(duplicates)
+                has_duplicates = True
+        
+        return DuplicateDetectionResult(
+            has_duplicates=has_duplicates,
+            potential_duplicates=all_duplicates,
+            new_entries=entries,
+            requires_confirmation=has_duplicates
+        )
+    
+    async def _consolidate_duplicates(self, duplicates: List[PotentialDuplicate], 
+                                    new_quantity: float) -> bool:
+        """Consolidate duplicate entries by adding quantities."""
+        for duplicate in duplicates:
+            # Add new quantity to existing quantity
+            total_quantity = duplicate.quantity + new_quantity
+            
+            # Update the existing stock movement
+            success = await self.airtable.update_stock_movement_quantity(
+                duplicate.movement_id, total_quantity
+            )
+            if not success:
+                return False
+        
+        return True
+```
+
+#### **Test Scenarios**
+```python
+# Test Phase 3: Inventory Service Integration
+def test_phase3_inventory_integration():
+    """Test duplicate detection integration with inventory service."""
+    
+    # Test duplicate detection in inventory flow
+    # Test quantity consolidation
+    # Test confirmation handling
+    # Test normal flow when no duplicates
+    # Test error handling
+```
+
+#### **Deliverables**
+- [ ] Modified `InventoryService` with duplicate detection
+- [ ] Quantity consolidation logic
+- [ ] Confirmation state management
+- [ ] Integration with existing inventory flow
+- [ ] End-to-end tests (20+ test methods)
+
+### **Phase 4: Testing & Refinement** ⏳
+**Duration**: 2-3 days  
+**Status**: PLANNING
+
+#### **Objectives**
+- Comprehensive end-to-end testing
+- Performance optimization
+- Edge case handling
+- User experience refinement
+
+#### **Test Scenarios**
+```python
+# Test Phase 4: Comprehensive Testing
+def test_phase4_comprehensive_testing():
+    """Test complete duplicate detection system."""
+    
+    # Test end-to-end flow
+    # Test performance with large datasets
+    # Test edge cases and error conditions
+    # Test user experience scenarios
+    # Test integration with existing features
+```
+
+#### **Deliverables**
+- [ ] Complete test suite (60+ test methods)
+- [ ] Performance benchmarks
+- [ ] Edge case handling
+- [ ] Documentation and user guides
+- [ ] Production readiness validation
+
+## **🔧 Technical Specifications**
+
+### **Similarity Algorithm Details**
+- **Threshold**: 0.7 (higher than search 0.5)
+- **Keyword Matching**: Exact word matches only
+- **Missing Keywords**: Up to 1 missing keyword allowed
+- **Order Independence**: "50kgs bags cement" matches "cement 50kgs bags"
+- **Quantity Similarity**: Must be same or very close (±10%)
+- **Unit Validation**: No automatic unit conversion
+
+### **Caching Strategy**
+- **Cache TTL**: 30 minutes
+- **Cache Scope**: Recent stock movements (last 30 days)
+- **Fallback**: Full database query if cache miss
+- **Refresh**: Background task every 15 minutes
+
+### **Data Structures**
+```python
+@dataclass
+class PotentialDuplicate:
+    item_name: str
+    quantity: float
+    unit: str
+    similarity_score: float
+    movement_id: str
+    timestamp: datetime
+    location: Optional[str]
+    category: Optional[str]
+    user_name: str
+
+@dataclass
+class DuplicateDetectionResult:
+    has_duplicates: bool
+    potential_duplicates: List[PotentialDuplicate]
+    new_entries: List[InventoryEntry]
+    requires_confirmation: bool
+```
+
+## **📊 Performance Requirements**
+
+### **Response Times**
+- **Duplicate Detection**: <200ms per entry
+- **Confirmation Dialog**: <100ms to display
+- **Quantity Update**: <300ms per consolidation
+- **Total Overhead**: <500ms per inventory batch
+
+### **Scalability**
+- **Concurrent Users**: Support 10+ simultaneous inventory operations
+- **Database Load**: Minimal impact on existing queries
+- **Memory Usage**: <50MB additional for caching
+
+## **🔒 Security & Permissions**
+
+### **Access Control**
+- **Admin Only**: Duplicate detection only for admin users
+- **Confirmation Required**: All duplicate consolidations require explicit confirmation
+- **Audit Trail**: Log all duplicate detection and consolidation actions
+
+### **Data Integrity**
+- **Atomic Operations**: Duplicate consolidations are atomic
+- **Rollback Support**: Failed consolidations can be rolled back
+- **Validation**: All quantity updates validated before applying
+
+## **📈 Success Metrics**
+
+### **Detection Accuracy**
+- **True Positives**: 95%+ of actual duplicates detected
+- **False Positives**: <5% of non-duplicates flagged
+- **User Confirmation**: 80%+ of detected duplicates properly handled
+
+### **Performance Impact**
+- **Processing Time**: <500ms additional per inventory batch
+- **User Experience**: <2 seconds for confirmation dialog
+- **System Load**: <10% increase in database queries
+
+## **🚀 Rollout Strategy**
+
+### **Phase 1**: Core Engine (Week 1)
+- Implement duplicate detection service
+- Add comprehensive unit tests
+- Performance optimization
+
+### **Phase 2**: User Interface (Week 2)
+- Telegram integration
+- Confirmation dialogs
+- User experience testing
+
+### **Phase 3**: Integration (Week 3)
+- Inventory service integration
+- End-to-end testing
+- Bug fixes and refinements
+
+### **Phase 4**: Production (Week 4)
+- Performance testing
+- User acceptance testing
+- Production deployment
+
+## **📝 Acceptance Criteria**
+
+### **Functional Requirements**
+- [ ] Detect similar inventory entries with 95%+ accuracy
+- [ ] Show clear confirmation dialogs with preview
+- [ ] Consolidate quantities for confirmed duplicates
+- [ ] Handle multiple duplicates per entry
+- [ ] Maintain audit trail for all changes
+
+### **Performance Requirements**
+- [ ] <500ms additional processing time per batch
+- [ ] Support 10+ concurrent users
+- [ ] <50MB additional memory usage
+- [ ] 99.9% uptime during operations
+
+### **User Experience Requirements**
+- [ ] Intuitive confirmation interface
+- [ ] Clear preview of changes
+- [ ] Easy cancel/retry options
+- [ ] Helpful error messages
+
+## **�� Open Decisions**
+
+### **Quantity Handling**
+- **Question**: How to handle different units (5kg vs 5000g)?
+- **Current Decision**: No automatic conversion, show warning
+- **Future Consideration**: Add unit conversion options
+
+### **Multiple Matches**
+- **Question**: How to handle one entry matching multiple existing entries?
+- **Current Decision**: Show all matches, let user choose
+- **Future Consideration**: Auto-select best match with override option
+
+### **Time-based Filtering**
+- **Question**: Should we prioritize recent entries in display order?
+- **Current Decision**: Show by similarity score, then by recency
+- **Future Consideration**: User-configurable sorting options
+
+## **📚 Test Coverage**
+
+### **Unit Tests (60+ methods)**
+- Duplicate detection algorithm
+- Similarity calculation
+- Keyword extraction
+- Quantity normalization
+- Caching mechanisms
+- Data structure validation
+
+### **Integration Tests (25+ methods)**
+- Telegram service integration
+- Inventory service integration
+- Callback query handling
+- Database operations
+- Error handling
+
+### **End-to-End Tests (15+ methods)**
+- Complete user workflows
+- Performance testing
+- Edge case scenarios
+- Multi-user scenarios
+- Data integrity validation
+
+### **Performance Tests (10+ methods)**
+- Response time benchmarks
+- Memory usage monitoring
+- Database query optimization
+- Concurrent user testing
+- Load testing
+
+This comprehensive plan provides a detailed roadmap for implementing the duplicate detection feature while maintaining the high quality and testing standards established in the existing codebase.

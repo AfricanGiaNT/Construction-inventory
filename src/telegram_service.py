@@ -6,7 +6,8 @@ from typing import List, Optional, Dict, Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.error import TelegramError
 
-from schemas import StockMovement, MovementType, Item
+from schemas import StockMovement, MovementType, Item, PaginatedSearchResults
+from services.duplicate_detection import PotentialDuplicate, DuplicateDetectionResult, MovementDuplicateResult, MovementDuplicateDetectionResult
 
 # Settings will be passed in constructor
 
@@ -198,6 +199,130 @@ class TelegramService:
         except Exception as e:
             logger.error(f"Error sending stock search results: {e}")
             return False
+
+    async def send_paginated_stock_results(self, chat_id: int, paginated_results: PaginatedSearchResults, 
+                                         pending_info: dict) -> bool:
+        """
+        Send paginated stock search results with navigation buttons.
+        
+        Args:
+            chat_id: Telegram chat ID to send the message to
+            paginated_results: PaginatedSearchResults object with pagination metadata
+            pending_info: Dictionary with pending movements info
+            
+        Returns:
+            Boolean indicating success or failure
+        """
+        try:
+            # Get items for current page
+            start_idx = (paginated_results.current_page - 1) * paginated_results.results_per_page
+            end_idx = start_idx + paginated_results.results_per_page
+            page_items = paginated_results.all_results[start_idx:end_idx]
+            
+            # Create search results text
+            text = f"🔍 <b>Stock Query Results for \"{paginated_results.query}\"</b>\n\n"
+            
+            # Add result count message
+            text += f"<i>Showing {len(page_items)} of {paginated_results.total_count} results</i>\n\n"
+            
+            # Add numbered results - only show item names initially
+            for i, item in enumerate(page_items, 1):
+                text += f"{i}. <b>{item.name}</b>\n"
+            
+            text += "\n"
+            
+            # Add instructions
+            text += "<b>How to select an item:</b>\n"
+            text += "• Click the button below the item name\n"
+            text += "• Or type the <b>exact name</b> (e.g., 'cement bags')\n"
+            text += "• Or type the <b>number</b> (e.g., '1' for the first item)"
+            
+            # Create inline keyboard with item buttons and pagination controls
+            keyboard = self._create_paginated_keyboard(paginated_results, page_items)
+            
+            # Send the message with inline keyboard
+            message_sent = await self.send_message(
+                chat_id, 
+                text, 
+                reply_markup={"inline_keyboard": keyboard}
+            )
+            return message_sent
+            
+        except Exception as e:
+            logger.error(f"Error sending paginated stock search results: {e}")
+            return False
+
+    def _create_paginated_keyboard(self, paginated_results: PaginatedSearchResults, page_items: List[Item]) -> List[List[Dict[str, str]]]:
+        """
+        Create inline keyboard for paginated stock results.
+        
+        Args:
+            paginated_results: PaginatedSearchResults object
+            page_items: Items for current page
+            
+        Returns:
+            List of keyboard rows
+        """
+        keyboard = []
+        
+        # Add item buttons (5 per page)
+        for i, item in enumerate(page_items, 1):
+            # Create a safe callback data (limit to 64 characters)
+            item_name_slug = item.name.replace(" ", "_").replace("-", "_")[:30]
+            callback_data = f"stock_item_{i}_{item_name_slug}"
+            
+            keyboard.append([{
+                "text": f"{i}. {item.name}",
+                "callback_data": callback_data
+            }])
+        
+        # Add pagination controls
+        pagination_row = []
+        
+        # Previous button
+        if self._should_show_previous_button(paginated_results.current_page):
+            prev_callback = f"stock_page_prev_{paginated_results.query_hash}_{paginated_results.current_page}"
+            pagination_row.append({
+                "text": "◀ Previous",
+                "callback_data": prev_callback
+            })
+        
+        # Page indicator
+        page_text = f"Page {paginated_results.current_page} of {paginated_results.total_pages}"
+        pagination_row.append({
+            "text": page_text,
+            "callback_data": "noop"  # Non-functional button for display
+        })
+        
+        # Next button
+        if self._should_show_next_button(paginated_results.current_page, paginated_results.total_pages):
+            next_callback = f"stock_page_next_{paginated_results.query_hash}_{paginated_results.current_page}"
+            pagination_row.append({
+                "text": "Next ▶",
+                "callback_data": next_callback
+            })
+        
+        # Show more button (same as Next, but different text)
+        if self._should_show_next_button(paginated_results.current_page, paginated_results.total_pages):
+            show_more_callback = f"stock_show_more_{paginated_results.query_hash}_{paginated_results.current_page}"
+            pagination_row.append({
+                "text": "Show more...",
+                "callback_data": show_more_callback
+            })
+        
+        # Add pagination row if it has any buttons
+        if pagination_row:
+            keyboard.append(pagination_row)
+        
+        return keyboard
+
+    def _should_show_previous_button(self, current_page: int) -> bool:
+        """Check if Previous button should be shown."""
+        return current_page > 1
+
+    def _should_show_next_button(self, current_page: int, total_pages: int) -> bool:
+        """Check if Next/Show more button should be shown."""
+        return current_page < total_pages
 
     async def send_item_details(self, chat_id: int, item: Item, 
                               pending_movements: List[StockMovement], 
@@ -439,10 +564,26 @@ class TelegramService:
             text += "📋 <b>AVAILABLE COMMANDS</b>\n\n"
             
             # Stock Operations
-            text += "📦 <b>Stock Operations</b>\n"
-            text += "• <b>/in</b> <i>item, qty unit, [details]</i> - Add stock\n"
-            text += "• <b>/out</b> <i>item, qty unit, [details]</i> - Remove stock\n"
+            text += "📦 <b>Stock Operations (New Batch System)</b>\n"
+            text += "• <b>/in</b> - Add stock with batch processing\n"
+            text += "• <b>/out</b> - Remove stock with batch processing\n"
+            text += "• <b>/preview in</b> - Preview duplicates before adding\n"
+            text += "• <b>/preview out</b> - Preview duplicates before removing\n"
             text += "• <b>/adjust</b> <i>item, ±qty unit</i> - Correct stock (admin)\n\n"
+            
+            text += "🔧 <b>Batch Command Features</b>\n"
+            text += "• Multiple batches in one command\n"
+            text += "• Smart duplicate detection & auto-merge\n"
+            text += "• Only item name & quantity required\n"
+            text += "• Smart defaults for missing parameters\n"
+            text += "• Batch summary before processing\n"
+            text += "• Progress indicators during processing\n"
+            text += "• Comprehensive error messages with suggestions\n\n"
+            
+            text += "📝 <b>Quick Examples</b>\n"
+            text += "• <code>/in Cement 50kg, 10 bags</code> (minimal)\n"
+            text += "• <code>/in -batch 1- project: site A\nCement 50kg, 10 bags</code>\n"
+            text += "• <code>/out -batch 1- project: mzuzu, driver: John, to: site\nSteel 12mm, 5 pieces</code>\n\n"
             
             # Queries
             text += "🔍 <b>Queries</b>\n"
@@ -473,6 +614,13 @@ class TelegramService:
             text += "• <code>/in project: Bridge, cement, 50 bags</code>\n"
             text += "• <code>/stock cement</code>\n"
             text += "• <code>/help /in</code> - Detailed help for /in command\n\n"
+            
+            # Troubleshooting
+            text += "🔧 <b>TROUBLESHOOTING</b>\n"
+            text += "• <b>Command not working?</b> Check format with <code>/preview in</code>\n"
+            text += "• <b>Duplicates found?</b> Bot will ask for confirmation\n"
+            text += "• <b>Batch failed?</b> Check error messages for suggestions\n"
+            text += "• <b>Need help?</b> Use <code>/help /in</code> for detailed guide\n\n"
             
             # Pro tip
             text += "💡 <b>PRO TIPS</b>\n"
@@ -652,4 +800,426 @@ class TelegramService:
             return True
         except Exception as e:
             logger.error(f"Error answering callback query: {e}")
+            return False
+    
+    async def send_duplicate_confirmation(self, chat_id: int, 
+                                        duplicates: List[PotentialDuplicate], 
+                                        new_entries: List[Any]) -> int:
+        """
+        Send duplicate confirmation dialog with inline keyboard.
+        
+        Args:
+            chat_id: Telegram chat ID to send the message to
+            duplicates: List of potential duplicates found
+            new_entries: List of new inventory entries
+            
+        Returns:
+            Message ID of the sent message, or -1 if failed
+        """
+        try:
+            message = self._format_duplicate_message(duplicates, new_entries)
+            keyboard = self._create_duplicate_confirmation_keyboard()
+            
+            success = await self.send_message(chat_id, message, keyboard)
+            if success:
+                # Return a placeholder message ID (in real implementation, this would be the actual message ID)
+                return 1  # Placeholder for now
+            return -1
+            
+        except Exception as e:
+            logger.error(f"Error sending duplicate confirmation: {e}")
+            return -1
+    
+    def _format_duplicate_message(self, duplicates: List[PotentialDuplicate], 
+                                new_entries: List[Any]) -> str:
+        """
+        Format duplicate detection message with preview.
+        
+        Args:
+            duplicates: List of potential duplicates
+            new_entries: List of new inventory entries
+            
+        Returns:
+            Formatted message text
+        """
+        try:
+            # Group duplicates by new entry
+            duplicates_by_entry = {}
+            for duplicate in duplicates:
+                # Find the matching new entry (simplified for now)
+                entry_key = f"entry_{len(duplicates_by_entry)}"
+                if entry_key not in duplicates_by_entry:
+                    duplicates_by_entry[entry_key] = []
+                duplicates_by_entry[entry_key].append(duplicate)
+            
+            text = "🔍 <b>Potential Duplicates Detected</b>\n\n"
+            text += "Found similar entries that might be duplicates:\n\n"
+            
+            # Show each new entry with its potential duplicates
+            for i, entry in enumerate(new_entries):
+                text += f"<b>New Entry:</b> {entry.item_name}, {entry.quantity}\n"
+                
+                # Find duplicates for this entry (simplified matching)
+                entry_duplicates = [d for d in duplicates if self._entries_similar(entry, d)]
+                
+                if entry_duplicates:
+                    text += "<b>Similar to:</b>\n"
+                    for duplicate in entry_duplicates[:3]:  # Show max 3 duplicates
+                        similarity_percent = int(duplicate.similarity_score * 100)
+                        text += f"• {duplicate.item_name}, {duplicate.quantity} ({similarity_percent}% match)"
+                        if duplicate.user_name:
+                            text += f" - Added by {duplicate.user_name}"
+                        text += "\n"
+                    
+                    if len(entry_duplicates) > 3:
+                        text += f"• ... and {len(entry_duplicates) - 3} more matches\n"
+                else:
+                    text += "<i>No similar entries found</i>\n"
+                
+                text += "\n"
+            
+            text += "<b>Action Required:</b>\n"
+            text += "Choose how to proceed with these entries.\n\n"
+            text += "<i>Note: Confirming will add quantities together for similar items.</i>"
+            
+            return text
+            
+        except Exception as e:
+            logger.error(f"Error formatting duplicate message: {e}")
+            return "Error formatting duplicate detection message."
+    
+    def _create_duplicate_confirmation_keyboard(self, duplicates: List[Any] = None) -> InlineKeyboardMarkup:
+        """
+        Create inline keyboard for duplicate confirmation actions.
+        
+        Args:
+            duplicates: List of duplicate items for individual confirmation
+            
+        Returns:
+            InlineKeyboardMarkup with confirmation buttons
+        """
+        try:
+            if duplicates and len(duplicates) <= 5:
+                # Create individual buttons for each duplicate (max 5 for UI limits)
+                keyboard = []
+                for i, duplicate in enumerate(duplicates[:5]):
+                    # Handle both dict and DuplicateItem objects
+                    item_name = None
+                    try:
+                        if isinstance(duplicate, dict):
+                            item_name = duplicate.get('batch_item', {}).get('item_name')
+                        elif hasattr(duplicate, 'batch_item'):
+                            # duplicate.batch_item can be dict or pydantic model dump
+                            item_name = duplicate.batch_item.get('item_name') if isinstance(duplicate.batch_item, dict) else getattr(duplicate.batch_item, 'item_name', None)
+                    except Exception:
+                        item_name = None
+                    if not item_name:
+                        item_name = f'Item {i+1}'
+                    item_name = str(item_name)[:20]
+                    keyboard.append([
+                        InlineKeyboardButton(f"✅ {item_name}", callback_data=f"confirm_individual_{i}"),
+                        InlineKeyboardButton(f"❌ {item_name}", callback_data=f"cancel_individual_{i}")
+                    ])
+                
+                # Add bulk action buttons
+                keyboard.append([
+                    InlineKeyboardButton("✅ Confirm All", callback_data="confirm_all_duplicates"),
+                    InlineKeyboardButton("❌ Cancel All", callback_data="cancel_all_duplicates")
+                ])
+                keyboard.append([
+                    InlineKeyboardButton("🔍 Show All Matches", callback_data="show_all_duplicates")
+                ])
+            else:
+                # Default bulk action keyboard
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ Confirm & Update", callback_data="confirm_duplicates"),
+                        InlineKeyboardButton("❌ Cancel & Check Stock", callback_data="cancel_duplicates")
+                    ],
+                    [
+                        InlineKeyboardButton("🔍 Show All Matches", callback_data="show_all_duplicates")
+                    ]
+                ]
+            
+            return InlineKeyboardMarkup(keyboard)
+            
+        except Exception as e:
+            logger.error(f"Error creating duplicate confirmation keyboard: {e}")
+            return InlineKeyboardMarkup([])
+    
+    async def send_duplicate_confirmation_dialog(self, chat_id: int, duplicates: List[Any], 
+                                               movement_type: str, batch_info: Dict[str, Any] = None) -> int:
+        """
+        Send duplicate confirmation dialog with individual item options.
+        
+        Args:
+            chat_id: Telegram chat ID
+            duplicates: List of duplicate items
+            movement_type: Type of movement (IN/OUT)
+            batch_info: Additional batch information
+            
+        Returns:
+            Message ID of sent message
+        """
+        try:
+            message = self._format_duplicate_confirmation_message(duplicates, movement_type, batch_info)
+            keyboard = self._create_duplicate_confirmation_keyboard(duplicates)
+            
+            return await self.send_message(chat_id, message, reply_markup=keyboard)
+            
+        except Exception as e:
+            logger.error(f"Error sending duplicate confirmation dialog: {e}")
+            return await self.send_error_message(chat_id, f"Error creating confirmation dialog: {str(e)}")
+    
+    def _format_duplicate_confirmation_message(self, duplicates: List[Any], movement_type: str, 
+                                             batch_info: Dict[str, Any] = None) -> str:
+        """
+        Format duplicate confirmation message with detailed information.
+        
+        Args:
+            duplicates: List of duplicate items
+            movement_type: Type of movement (IN/OUT)
+            batch_info: Additional batch information
+            
+        Returns:
+            Formatted message string
+        """
+        try:
+            message = f"⚠️ <b>Potential Duplicates Detected!</b>\n\n"
+            
+            if batch_info:
+                message += f"📋 <b>Batch {batch_info.get('batch_number', 1)} of {batch_info.get('total_batches', 1)}</b>\n"
+                message += f"🔄 <b>Movement Type:</b> {movement_type.upper()}\n\n"
+            
+            message += f"Found {len(duplicates)} similar items in your batch:\n\n"
+            
+            for i, duplicate in enumerate(duplicates[:5], 1):  # Show max 5 for readability
+                # Handle both dict and DuplicateItem objects
+                if hasattr(duplicate, 'batch_item'):
+                    batch_item = duplicate.batch_item
+                    existing_item = duplicate.existing_item
+                    similarity = duplicate.similarity_score
+                    match_type = duplicate.match_type
+                else:
+                    batch_item = duplicate.get('batch_item', {})
+                    existing_item = duplicate.get('existing_item', {})
+                    similarity = duplicate.get('similarity_score', 0)
+                    match_type = duplicate.get('match_type', 'unknown')
+                
+                item_name = batch_item.get('item_name', f'Item {i}')
+                quantity = batch_item.get('quantity', 0)
+                existing_quantity = existing_item.get('on_hand', 0)
+                existing_name = existing_item.get('name', 'Unknown')
+                
+                message += f"<b>{i}. {item_name}</b> ({quantity})\n"
+                message += f"   → Matches: {existing_name} ({existing_quantity})\n"
+                message += f"   → Similarity: {similarity:.1%} ({match_type})\n"
+                
+                # Add stock level warning for OUT movements
+                if movement_type.upper() == "OUT" and existing_quantity < quantity:
+                    message += f"   ⚠️ <b>Insufficient stock!</b> (Need: {quantity}, Have: {existing_quantity})\n"
+                
+                message += "\n"
+            
+            if len(duplicates) > 5:
+                message += f"... and {len(duplicates) - 5} more duplicates\n\n"
+            
+            message += "<b>Action Required:</b> Choose how to proceed with each item.\n"
+            message += "• <b>✅ Confirm:</b> Merge quantities with existing item\n"
+            message += "• <b>❌ Cancel:</b> Skip this item\n"
+            message += "• <b>🔍 Show All:</b> View detailed match information\n"
+            
+            return message
+            
+        except Exception as e:
+            logger.error(f"Error formatting duplicate confirmation message: {e}")
+            return "Error formatting duplicate confirmation message."
+    
+    def _entries_similar(self, entry: Any, duplicate: PotentialDuplicate) -> bool:
+        """
+        Check if a new entry is similar to a potential duplicate.
+        
+        Args:
+            entry: New inventory entry
+            duplicate: Potential duplicate
+            
+        Returns:
+            True if entries are similar
+        """
+        try:
+            # Simple similarity check based on item names
+            # In a real implementation, this would use the duplicate detection service
+            entry_name_lower = entry.item_name.lower()
+            duplicate_name_lower = duplicate.item_name.lower()
+            
+            # Check if they share significant keywords
+            entry_words = set(entry_name_lower.split())
+            duplicate_words = set(duplicate_name_lower.split())
+            
+            # If they share at least 50% of words, consider them similar
+            if entry_words and duplicate_words:
+                common_words = entry_words & duplicate_words
+                similarity_ratio = len(common_words) / min(len(entry_words), len(duplicate_words))
+                return similarity_ratio >= 0.5
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error checking entry similarity: {e}")
+            return False
+    
+    async def send_duplicate_confirmation_result(self, chat_id: int, 
+                                               updated_items: List[str], 
+                                               failed_items: List[str]) -> bool:
+        """
+        Send confirmation result after processing duplicates.
+        
+        Args:
+            chat_id: Telegram chat ID to send the message to
+            updated_items: List of successfully updated items
+            failed_items: List of items that failed to update
+            
+        Returns:
+            Boolean indicating success or failure
+        """
+        try:
+            text = "✅ <b>Duplicate Processing Complete</b>\n\n"
+            
+            if updated_items:
+                text += f"<b>Updated Items ({len(updated_items)}):</b>\n"
+                for item in updated_items:
+                    text += f"• {item}\n"
+                text += "\n"
+            
+            if failed_items:
+                text += f"<b>Failed Items ({len(failed_items)}):</b>\n"
+                for item in failed_items:
+                    text += f"• {item}\n"
+                text += "\n"
+            
+            if not updated_items and not failed_items:
+                text += "No items were processed.\n"
+            
+            return await self.send_message(chat_id, text)
+            
+        except Exception as e:
+            logger.error(f"Error sending duplicate confirmation result: {e}")
+            return False
+    
+    async def send_movement_duplicate_confirmation(self, chat_id: int, movement_duplicates: Dict[str, Any], movements: List[Any]) -> bool:
+        """Send movement duplicate confirmation message with inline keyboard."""
+        try:
+            # Format the duplicate message
+            message = self._format_movement_duplicate_message(movement_duplicates, movements)
+            
+            # Create inline keyboard
+            keyboard = self._create_movement_duplicate_keyboard(movement_duplicates, movements)
+            
+            # Send message with keyboard
+            await self.send_message(chat_id, message, reply_markup=keyboard)
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error sending movement duplicate confirmation: {e}")
+            return False
+    
+    def _format_movement_duplicate_message(self, movement_duplicates: Dict[str, Any], movements: List[Any]) -> str:
+        """Format movement duplicate confirmation message."""
+        try:
+            message = "🔍 <b>Potential Duplicates Detected!</b>\n\n"
+            message += f"Found similar items in {len(movement_duplicates)} of {len(movements)} movements:\n\n"
+            
+            for movement_id, result in movement_duplicates.items():
+                if isinstance(result, MovementDuplicateResult) and result.has_duplicates:
+                    # Find the movement details
+                    movement = next((m for m in movements if m.id == movement_id), None)
+                    if movement:
+                        message += f"<b>Stock {movement.movement_type.value}:</b> {movement.item_name}, {movement.quantity} {movement.unit}\n"
+                        
+                        for duplicate in result.potential_duplicates:
+                            message += f"• {duplicate.item_name}, {duplicate.quantity} {duplicate.unit} ({duplicate.similarity_score:.0%} match)\n"
+                        message += "\n"
+            
+            message += "<b>Action Required:</b> Choose how to proceed with each movement.\n"
+            message += "<i>Note: Confirming will add quantities together for similar items.</i>"
+            
+            return message
+            
+        except Exception as e:
+            logger.error(f"Error formatting movement duplicate message: {e}")
+            return "🔍 <b>Potential Duplicates Detected!</b>\n\nPlease review the similar items and choose how to proceed."
+    
+    def _create_movement_duplicate_keyboard(self, movement_duplicates: Dict[str, Any], movements: List[Any] = None) -> InlineKeyboardMarkup:
+        """Create inline keyboard for movement duplicate confirmation."""
+        try:
+            keyboard = []
+            
+            for movement_id, result in movement_duplicates.items():
+                if isinstance(result, MovementDuplicateResult) and result.has_duplicates:
+                    # Find the movement details
+                    movement = next((m for m in movements if m.id == movement_id), None)
+                    if movement:
+                        # Create buttons for this movement
+                        movement_short = movement.item_name[:20] + "..." if len(movement.item_name) > 20 else movement.item_name
+                        
+                        confirm_btn = InlineKeyboardButton(
+                            f"✔ Confirm {movement.movement_type.value}: {movement_short}",
+                            callback_data=f"confirm_movement_duplicate_{movement_id}"
+                        )
+                        cancel_btn = InlineKeyboardButton(
+                            f"❌ Cancel {movement.movement_type.value}: {movement_short}",
+                            callback_data=f"cancel_movement_duplicate_{movement_id}"
+                        )
+                        
+                        keyboard.append([confirm_btn, cancel_btn])
+            
+            # Add batch action buttons
+            if len(movement_duplicates) > 1:
+                keyboard.append([
+                    InlineKeyboardButton("✔ Confirm All", callback_data="confirm_all_movement_duplicates"),
+                    InlineKeyboardButton("❌ Cancel All", callback_data="cancel_all_movement_duplicates")
+                ])
+                keyboard.append([
+                    InlineKeyboardButton("• Show All Matches", callback_data="show_all_movement_duplicate_matches")
+                ])
+            
+            return InlineKeyboardMarkup(keyboard)
+            
+        except Exception as e:
+            logger.error(f"Error creating movement duplicate keyboard: {e}")
+            return InlineKeyboardMarkup([])
+    
+    async def send_movement_duplicate_result(self, chat_id: int, result: Any) -> bool:
+        """Send movement duplicate detection result."""
+        try:
+            message = "🔍 <b>Movement Duplicate Detection Result</b>\n\n"
+            message += f"• Total movements checked: {result.total_movements}\n"
+            message += f"• Duplicates found: {result.total_duplicates}\n"
+            message += f"• Requires stock check: {'Yes' if result.requires_stock_check else 'No'}\n\n"
+            
+            if result.has_any_duplicates:
+                message += "⚠️ <b>Action Required:</b> Please review the duplicate confirmation messages above."
+            else:
+                message += "✅ <b>No duplicates found.</b> Proceeding with normal approval."
+            
+            await self.send_message(chat_id, message)
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error sending movement duplicate result: {e}")
+            return False
+    
+    async def edit_message_text(self, chat_id: int, message_id: int, text: str, reply_markup: InlineKeyboardMarkup = None) -> bool:
+        """Edit an existing message text."""
+        try:
+            await self.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error editing message text: {e}")
             return False
